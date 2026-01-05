@@ -959,6 +959,12 @@ def init_db():
         print("✔ Default superadmin created: admin / admin123")
 
     conn.commit()
+def migrate_license_machine_id():
+    try:
+        execute("ALTER TABLE license ADD COLUMN machine_id TEXT")
+    except Exception:
+        # Column already exists → safe to ignore
+        pass
 
 # -------------------------------------------------------------------
 # ORDER HELPERS
@@ -5060,7 +5066,6 @@ def main():
     # ============================================================
     # 🔷 GLOBAL NEON BRANDING (ALL PAGES – SAFE)
     # ============================================================
-    profile = None
     try:
         profile = get_business_profile()
     except Exception:
@@ -5129,13 +5134,20 @@ def main():
         st.session_state["ws_started"] = True
 
     init_db()
+
+    # ============================================================
+    # 🔧 SAFE DB MIGRATION (machine_id) — RUNS ONCE
+    # ============================================================
+    try:
+        execute("ALTER TABLE license ADD COLUMN machine_id TEXT")
+    except Exception:
+        pass  # column already exists → SAFE
+
     # ============================================================
     # 🔒 SESSION KEEP-ALIVE (PREVENT AUTO LOGOUT)
     # ============================================================
-    if "last_activity" not in st.session_state:
-        st.session_state["last_activity"] = time.time()
-    # Update activity timestamp on every rerun
     st.session_state["last_activity"] = time.time()
+
     # ============================================================
     # AUTO CLEANUP
     # ============================================================
@@ -5179,13 +5191,12 @@ def main():
     show_expiry_warning_if_needed(active_license)
 
     # ============================================================
-    # 🔑 LOGIN (FIXED – NO DOUBLE FORM)
+    # 🔑 LOGIN (NO DOUBLE FORM / NO GLITCH)
     # ============================================================
     if "user" not in st.session_state:
         with st.form("login", clear_on_submit=True):
             username = st.text_input("Username")
             password = st.text_input("Password", type="password")
-
             submitted = st.form_submit_button("Login")
 
             if submitted:
@@ -5194,7 +5205,6 @@ def main():
                     st.rerun()
                 else:
                     st.error("Invalid credentials")
-
         return
 
     user = st.session_state["user"]
@@ -5243,9 +5253,7 @@ def main():
         st.markdown(f"**{user['username']}** ({role})")
 
         for mod in visible_modules:
-            is_active = st.session_state["active_page"] == mod
-            btn_type = "primary" if is_active else "secondary"
-
+            btn_type = "primary" if st.session_state["active_page"] == mod else "secondary"
             if st.button(mod, type=btn_type, width="stretch"):
                 st.session_state["active_page"] = mod
                 st.rerun()
@@ -5281,7 +5289,3 @@ def main():
             reports_panel()
         elif page == "Admin":
             admin_panel()
-
-
-if __name__ == "__main__":
-    main()
