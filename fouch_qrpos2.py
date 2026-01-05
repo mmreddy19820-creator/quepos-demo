@@ -3342,16 +3342,6 @@ def _kds_mark_printed(order_id: str, item_ids: list, full=False):
 def kds_view():
     """
     🍳 Unified Kitchen Display System (KDS)
-    --------------------------------------------
-    • Shows ONLY active kitchen orders
-    • Universal for Dine-in / Takeaway / Approved-QR
-    • Kitchen statuses ONLY:
-        - in_progress
-        - ready
-    • Item-level tracking (pending → done)
-    • Auto-print + sound alerts preserved
-    • NO order closing here (FOH responsibility)
-    --------------------------------------------
     """
     import time
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
@@ -3370,24 +3360,18 @@ def kds_view():
 
     enable_sound = st.checkbox("Enable sound alerts for new items", value=True)
 
-    # Auto-print toggle
     st.session_state.setdefault("kds_auto_print", False)
     auto_print_enabled = st.checkbox(
         "Enable Auto-Print", value=st.session_state["kds_auto_print"]
     )
     st.session_state["kds_auto_print"] = auto_print_enabled
 
-    # ======================================================
-    # 🔒 LOAD ONLY VALID KITCHEN ORDERS (FINAL FIX)
-    # ======================================================
+    # ---------------- Load kitchen orders ----------------
     orders_raw = fetchall("""
         SELECT *
         FROM orders
         WHERE status IN ('in_progress','ready')
-          AND (
-                order_type != 'qr'
-                OR approved = 1
-              )
+          AND (order_type != 'qr' OR approved = 1)
         ORDER BY created_at ASC
     """)
 
@@ -3396,45 +3380,19 @@ def kds_view():
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    # ======================================================
-    # 🎨 CSS Styling (UNCHANGED)
-    # ======================================================
+    # ---------------- Styles ----------------
     st.markdown("""
     <style>
-    .status-in_progress {
-        background: #d97706 !important;
-        color: #ffffff !important;
-        border-radius: 10px !important;
-        padding: 10px !important;
-        margin-bottom: 6px !important;
-        font-weight: 700 !important;
-    }
-    .status-ready {
-        background: #2563eb !important;
-        color: #ffffff !important;
-        border-radius: 10px !important;
-        padding: 10px !important;
-        margin-bottom: 6px !important;
-        font-weight: 700 !important;
-    }
-    .status-done {
-        background: #15803D !important;
-        color: #ffffff !important;
-        border-radius: 10px !important;
-        padding: 10px !important;
-        margin-bottom: 6px !important;
-        font-weight: 800 !important;
-        opacity: 0.85 !important;
-    }
+    .status-in_progress { background:#d97706;color:white;padding:10px;border-radius:10px;font-weight:700; }
+    .status-ready { background:#2563eb;color:white;padding:10px;border-radius:10px;font-weight:700; }
+    .status-done { background:#15803D;color:white;padding:10px;border-radius:10px;font-weight:800;opacity:0.85; }
     </style>
     """, unsafe_allow_html=True)
 
     auto_print_queue = []
     any_new_items = False
 
-    # ======================================================
-    # DISPLAY EACH ORDER
-    # ======================================================
+    # ---------------- Orders loop ----------------
     for o in orders_raw:
         order_id = o["id"]
 
@@ -3451,44 +3409,16 @@ def kds_view():
         if not items:
             continue
 
-        # ✅ NEW: if ALL items are ready/done → hide from KDS
-        all_done_for_kds = all(
-            (item["kds_status"] or "").lower() in ("ready", "done")
-            for item in items
-        )
-        if all_done_for_kds:
-            # Do not show this order on KDS; FOH still handles it
+        # Hide order if all done
+        if all((it["kds_status"] or "").lower() == "done" for it in items):
             continue
-
-        log = _kds_get_log(order_id)
-        printed_ids = log["printed_items"]
-
-        current_ids = {it["id"] for it in items}
-        new_item_ids = current_ids - printed_ids
-
-        if new_item_ids:
-            any_new_items = True
-            if auto_print_enabled:
-                auto_print_queue.append((order_id, list(new_item_ids), False))
-
-        if not log["full_print_done"] and auto_print_enabled:
-            auto_print_queue.append((order_id, [it["id"] for it in items], True))
 
         order_label = (
             f"{o['order_type'].capitalize()} • "
             f"{o.get('table_no') or o.get('token') or 'No Ref'} • "
             f"Order {order_id[:8]}"
         )
-
         st.markdown(f"<b>{order_label}</b>", unsafe_allow_html=True)
-
-        if st.button("🖨️ Print Ticket", key=f"print_{order_id}"):
-            if not log["full_print_done"]:
-                print_ticket_via_component(order_id)
-                _kds_mark_printed(order_id, [it["id"] for it in items], full=True)
-            elif new_item_ids:
-                print_ticket_via_component(order_id, only_items=list(new_item_ids))
-                _kds_mark_printed(order_id, list(new_item_ids))
 
         for i in range(0, len(items), 3):
             cols = st.columns(3)
@@ -3498,52 +3428,50 @@ def kds_view():
 
                 item = items[i + j]
                 item_id = item["id"]
-                current_status = item["kds_status"]
-
-                css_key = current_status if current_status in (
-                    "in_progress", "ready", "done"
-                ) else "in_progress"
-
-                note_text = f" — {item['note']}" if item.get("note") else ""
+                current_status = item["kds_status"] or "pending"
+                css_key = current_status if current_status in ("in_progress","ready","done") else "in_progress"
+                note = f" — {item['note']}" if item.get("note") else ""
 
                 with col:
                     st.markdown(
                         f"<div class='status-{css_key}'>"
-                        f"{item['name']} x{item['qty']}{note_text}<br>"
+                        f"{item['name']} x{item['qty']}{note}<br>"
                         f"<b>Status:</b> {current_status.upper()}"
                         f"</div>",
                         unsafe_allow_html=True,
                     )
 
-                    if st.button("✅ DONE", key=f"done_item_{item_id}") and current_status != "done":
-                        execute(
-                            """
-                            UPDATE kds_items_status
-                            SET status='done', updated_at=datetime('now')
-                            WHERE order_item_id=?
-                            """,
-                            (item_id,),
+                    if st.button("✅ DONE", key=f"done_{item_id}") and current_status != "done":
+                        # 🔥 FIX: UPSERT logic
+                        exists = fetchone(
+                            "SELECT id FROM kds_items_status WHERE order_item_id=?",
+                            (item_id,)
                         )
+
+                        if exists:
+                            execute(
+                                "UPDATE kds_items_status SET status='done', updated_at=datetime('now') WHERE order_item_id=?",
+                                (item_id,)
+                            )
+                        else:
+                            execute(
+                                """
+                                INSERT INTO kds_items_status
+                                (id, order_item_id, status, updated_at)
+                                VALUES (lower(hex(randomblob(16))), ?, 'done', datetime('now'))
+                                """,
+                                (item_id,)
+                            )
+
                         push_realtime_event("kds_updated", {"order_id": order_id})
                         st.rerun()
 
         st.markdown("---")
 
-    # ======================================================
-    # AUTO-PRINT EXECUTION
-    # ======================================================
-    for (order_id, item_ids, full) in auto_print_queue:
-        print_ticket_via_component(order_id, only_items=None if full else item_ids)
-        _kds_mark_printed(order_id, item_ids, full=full)
-
-    # ======================================================
-    # SOUND ALERT
-    # ======================================================
+    # ---------------- Sound alert ----------------
     if any_new_items and enable_sound:
         st.markdown(
-            "<audio autoplay>"
-            "<source src='https://actions.google.com/sounds/v1/alarms/beep_short.ogg' type='audio/ogg'>"
-            "</audio>",
+            "<audio autoplay><source src='https://actions.google.com/sounds/v1/alarms/beep_short.ogg'></audio>",
             unsafe_allow_html=True,
         )
 
@@ -5176,6 +5104,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
