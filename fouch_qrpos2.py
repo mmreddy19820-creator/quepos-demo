@@ -843,6 +843,15 @@ def init_db():
             last_run_date TEXT
         )
     """)
+        # -------------------------------
+    # 🔧 SAFE DB MIGRATION (license.machine_id)
+    # -------------------------------
+    try:
+        conn.execute("ALTER TABLE license ADD COLUMN machine_id TEXT")
+        conn.commit()
+    except Exception:
+        pass  # column already exists
+
 
     # ============================================================
     # BUSINESS PROFILE (SAFE + CURRENCY LOCK)
@@ -5135,14 +5144,7 @@ def main():
 
     init_db()
 
-    # ============================================================
-    # 🔧 SAFE DB MIGRATION (machine_id) — RUNS ONCE
-    # ============================================================
-    try:
-        execute("ALTER TABLE license ADD COLUMN machine_id TEXT")
-    except Exception:
-        pass  # column already exists → SAFE
-
+    
     # ============================================================
     # 🔒 SESSION KEEP-ALIVE (PREVENT AUTO LOGOUT)
     # ============================================================
@@ -5289,3 +5291,4 @@ def main():
             reports_panel()
         elif page == "Admin":
             admin_panel()
+
