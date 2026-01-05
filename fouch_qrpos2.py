@@ -663,7 +663,7 @@ def init_db():
             password_hash TEXT,
             full_name TEXT,
             role TEXT,
-            allowed_modules TEXT DEFAULT '["Home","Orders","KDS","Inventory"]'
+            allowed_modules TEXT
         )
     """)
 
@@ -743,7 +743,7 @@ def init_db():
         c.execute("ALTER TABLE payments ADD COLUMN tax_amount REAL DEFAULT 0")
 
     # ============================================================
-    # KDS STATUS
+    # KDS
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS kds_items_status (
@@ -756,7 +756,7 @@ def init_db():
     """)
 
     # ============================================================
-    # LICENSE (CRITICAL)
+    # LICENSE (FULLY MIGRATION-SAFE)
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS license (
@@ -764,8 +764,9 @@ def init_db():
             license_key TEXT,
             customer_name TEXT,
             expires_on TEXT,
-            is_expired INTEGER DEFAULT 0,
+            created_at TEXT,
             last_run_date TEXT,
+            is_expired INTEGER DEFAULT 0,
             machine_id TEXT
         )
     """)
@@ -773,8 +774,8 @@ def init_db():
     c.execute("PRAGMA table_info(license)")
     lic_cols = [r[1] for r in c.fetchall()]
 
-    if "machine_id" not in lic_cols:
-        c.execute("ALTER TABLE license ADD COLUMN machine_id TEXT")
+    if "created_at" not in lic_cols:
+        c.execute("ALTER TABLE license ADD COLUMN created_at TEXT")
 
     if "last_run_date" not in lic_cols:
         c.execute("ALTER TABLE license ADD COLUMN last_run_date TEXT")
@@ -782,13 +783,16 @@ def init_db():
     if "is_expired" not in lic_cols:
         c.execute("ALTER TABLE license ADD COLUMN is_expired INTEGER DEFAULT 0")
 
+    if "machine_id" not in lic_cols:
+        c.execute("ALTER TABLE license ADD COLUMN machine_id TEXT")
+
     # ============================================================
     # BUSINESS PROFILE
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS business_profile (
             id INTEGER PRIMARY KEY CHECK (id = 1),
-            business_name TEXT NOT NULL,
+            business_name TEXT,
             address TEXT,
             phone TEXT,
             vat_no TEXT,
@@ -805,50 +809,10 @@ def init_db():
     """)
 
     # ============================================================
-    # KDS TRIGGERS
-    # ============================================================
-    c.execute("DROP TRIGGER IF EXISTS create_kds_status;")
-    c.execute("""
-        CREATE TRIGGER create_kds_status
-        AFTER INSERT ON order_items
-        BEGIN
-            INSERT INTO kds_items_status (id, order_item_id, status, updated_at)
-            VALUES (lower(hex(randomblob(16))), NEW.id, 'pending', datetime('now'));
-        END;
-    """)
-
-    c.execute("DROP TRIGGER IF EXISTS auto_in_progress_order;")
-    c.execute("""
-        CREATE TRIGGER auto_in_progress_order
-        AFTER INSERT ON order_items
-        BEGIN
-            UPDATE orders
-            SET status='in_progress',
-                updated_at=datetime('now')
-            WHERE id = NEW.order_id
-              AND status='pending'
-              AND order_type IN ('dine','takeaway','qr');
-        END;
-    """)
-
-    # ============================================================
-    # INDEXES
-    # ============================================================
-    c.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_kds_order_item ON kds_items_status(order_item_id);")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_payments_order ON payments(order_id);")
-
-    # ============================================================
     # DEFAULT SUPERADMIN
     # ============================================================
     c.execute("SELECT COUNT(*) FROM users")
     if c.fetchone()[0] == 0:
-        full_modules = json.dumps([
-            "Home", "Orders", "KDS", "Inventory",
-            "Menu", "Payments", "Reports", "Admin", "Takeaway Status"
-        ])
         c.execute("""
             INSERT INTO users
             (id, username, password_hash, full_name, role, allowed_modules)
@@ -859,11 +823,15 @@ def init_db():
             hash_password("admin123"),
             "Default Admin",
             "superadmin",
-            full_modules
+            json.dumps([
+                "Home", "Orders", "KDS", "Inventory",
+                "Menu", "Payments", "Reports", "Admin", "Takeaway Status"
+            ])
         ))
 
     conn.commit()
     conn.close()
+
 
 
 # -------------------------------------------------------------------
@@ -5187,6 +5155,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
