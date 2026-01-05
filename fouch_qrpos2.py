@@ -3013,9 +3013,8 @@ def takeaway_status_panel():
         • shown for TODAY only (history)
     - Safe across midnight
     - Search by TOKEN NUMBER only
-    - ❗ Hides takeaway orders with no items
+    - ❗ Hides takeaway orders that have no items
     """
-    import pandas as pd
 
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
     st.subheader("Takeaway Status")
@@ -3040,7 +3039,7 @@ def takeaway_status_panel():
         )
 
     # ------------------------------------------------------------
-    # STATUS FILTER
+    # STATUS FILTERS
     # ------------------------------------------------------------
     if include_closed:
         status_clause = """
@@ -3061,9 +3060,7 @@ def takeaway_status_panel():
         WHERE o.order_type = 'takeaway'
         {status_clause}
           AND EXISTS (
-              SELECT 1
-              FROM order_items oi
-              WHERE oi.order_id = o.id
+              SELECT 1 FROM order_items oi WHERE oi.order_id = o.id
           )
     """
     params = []
@@ -3086,45 +3083,52 @@ def takeaway_status_panel():
     # ------------------------------------------------------------
     for o in orders:
         order_id = o["id"]
+        token = o.get("token") or "N/A"
+        total = float(o.get("total") or 0.0)
 
         # ======================================================
-        # 🔁 KITCHEN → ORDER STATUS SYNC (FIX)
+        # 🔁 KITCHEN → ORDER STATUS SYNC (CORRECT & SAFE)
         # ======================================================
-        kds_rows = fetchall(
+        totals = fetchone(
+            "SELECT COUNT(*) AS cnt FROM order_items WHERE order_id=?",
+            (order_id,)
+        )
+        done_cnt = fetchone(
             """
-            SELECT COALESCE(status,'pending') AS status
+            SELECT COUNT(*) AS cnt
             FROM kds_items_status
-            WHERE order_item_id IN (
-                SELECT id FROM order_items WHERE order_id=?
-            )
+            WHERE status='done'
+              AND order_item_id IN (
+                  SELECT id FROM order_items WHERE order_id=?
+              )
             """,
             (order_id,)
         )
 
-        if kds_rows:
-            all_done = all(r["status"] == "done" for r in kds_rows)
-            new_status = "ready" if all_done else "in_progress"
+        total_items = totals["cnt"] if totals else 0
+        done_items = done_cnt["cnt"] if done_cnt else 0
+
+        if total_items > 0:
+            new_status = "ready" if done_items == total_items else "in_progress"
 
             if o["status"] != new_status:
                 execute(
                     "UPDATE orders SET status=?, updated_at=datetime('now') WHERE id=?",
                     (new_status, order_id)
                 )
-                o["status"] = new_status  # reflect immediately in UI
+                o["status"] = new_status  # reflect immediately
 
-        # ======================================================
-        # DISPLAY HEADER
-        # ======================================================
-        token = o.get("token") or "N/A"
         status_raw = (o.get("status") or "").upper()
-        total = float(o.get("total") or 0.0)
 
+        # 🎨 STATUS DISPLAY
         if status_raw in ("CLOSED", "PAID"):
             status_html = "<span style='color:#16a34a;font-weight:900;'>CLOSED</span>"
         elif status_raw == "READY":
             status_html = "<span style='color:#2563eb;font-weight:900;'>READY (COLLECT)</span>"
-        else:
+        elif status_raw == "IN_PROGRESS":
             status_html = "<span style='color:#dc2626;font-weight:900;'>IN PROGRESS</span>"
+        else:
+            status_html = status_raw
 
         st.markdown(
             f"""
@@ -3137,9 +3141,7 @@ def takeaway_status_panel():
             unsafe_allow_html=True,
         )
 
-        # ----------------------------------------------------
-        # ITEMS (READ ONLY)
-        # ----------------------------------------------------
+        # ---- Items + KDS status (READ-ONLY) ----
         items = fetchall(
             """
             SELECT
@@ -3154,7 +3156,12 @@ def takeaway_status_panel():
             (order_id,)
         )
 
-        if items:
+        if not items:
+            st.markdown(
+                "<div style='font-size:0.85rem;color:#9ca3af;'>No items found.</div>",
+                unsafe_allow_html=True,
+            )
+        else:
             df = pd.DataFrame(items)
             df["tax_amount"] = df["qty"] * df["unit_price"] * (df["tax"] / 100)
             df["line_total"] = df["qty"] * df["unit_price"] + df["tax_amount"]
@@ -3185,7 +3192,6 @@ def takeaway_status_panel():
         st.markdown("---")
 
     st.markdown("</div>", unsafe_allow_html=True)
-
 
 def generate_bill_html(order_id: str) -> str:
     order = fetchone("SELECT * FROM orders WHERE id=?", (order_id,))
@@ -5219,6 +5225,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
