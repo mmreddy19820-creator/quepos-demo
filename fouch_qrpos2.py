@@ -282,12 +282,18 @@ def generate_qr_sig(table_no: str) -> str:
 def validate_qr_sig(table_no: str, sig: str, strict: bool = False) -> bool:
     """
     Validate HMAC signature for QR link.
-    - strict=False (default): warn but allow if signature missing/mismatch
-    - strict=True: reject on mismatch
+
+    Supports:
+    - Legacy 12-char signatures
+    - Current HMAC-based signatures
+
+    strict=False → allow access but warn
+    strict=True  → block on mismatch
     """
     if not table_no:
         return False
 
+    # No signature provided
     if not sig:
         if strict:
             return False
@@ -295,17 +301,31 @@ def validate_qr_sig(table_no: str, sig: str, strict: bool = False) -> bool:
             print(f"[QR SECURITY] No signature for table {table_no}, leniently allowed.")
             return True
 
+    # Secret (safe fallback for local / cloud)
     secret = st.secrets.get("HMAC_SECRET_KEY", "default_secret")
-    expected = hmac.new(secret.encode(), table_no.encode(), hashlib.sha256).hexdigest()[:12]
 
-    if hmac.compare_digest(expected, sig):
+    # Generate expected signatures (support legacy + new)
+    expected_full = hmac.new(
+        secret.encode(),
+        table_no.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    expected_12 = expected_full[:12]
+    expected_16 = expected_full[:16]
+
+    # Accept any known valid format
+    if sig in (expected_12, expected_16, expected_full):
         return True
-    elif strict:
+
+    # Mismatch handling
+    if strict:
         print(f"[QR SECURITY] Signature mismatch for table {table_no} — strict reject.")
         return False
     else:
         print(f"[QR SECURITY] Signature mismatch for table {table_no} — leniently allowed.")
         return True
+
 
 
 
@@ -4248,7 +4268,15 @@ def qr_order_page(table_no: str = None):
         return
 
     table_no = str(table_no).upper().strip()
-    validate_qr_sig(table_no, sig, strict=False)
+
+    # ============================================================
+    # ✅ SAFE QR SIGNATURE VALIDATION (WON'T BLOCK PAGE)
+    # ============================================================
+    try:
+        validate_qr_sig(table_no, sig, strict=False)
+    except Exception:
+        # Do NOT block customer ordering page
+        st.warning("⚠️ QR security signature missing/invalid. Demo mode access enabled.")
 
     cart_key = f"qr_cart_{table_no}"
 
@@ -4401,6 +4429,7 @@ def qr_order_page(table_no: str = None):
         ):
             push_realtime_event("bill_request", {"table_no": table_no})
             st.rerun()
+
 
 
 
@@ -5147,6 +5176,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
