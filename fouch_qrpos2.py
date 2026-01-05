@@ -446,9 +446,10 @@ def license_activation_screen():
 
     • Asks for Customer Name, Expiry (Year+Month) and License Key
     • Validates using generate_license_key()
-    • Saves into DB (license table) + license.lock file
-    • On success, reruns app so main() continues normally
+    • Stores SINGLE license in DB
+    • Forces rerun so app proceeds correctly
     """
+
     st.markdown(
         "<h2 style='text-align:center;margin-bottom:0.5rem;'>Que-POS License Activation</h2>",
         unsafe_allow_html=True,
@@ -460,7 +461,9 @@ def license_activation_screen():
         unsafe_allow_html=True,
     )
 
-    # If there is already a license row, show info
+    # ------------------------------------------------------------
+    # EXISTING VALID LICENSE
+    # ------------------------------------------------------------
     existing = get_active_license()
     if existing and not existing.get("is_expired", False):
         st.success(
@@ -468,9 +471,12 @@ def license_activation_screen():
             f"valid till **{existing['expires_on']}**."
         )
         if st.button("Continue to Login"):
-            return  # main() will continue after this function returns
+            st.rerun()   # ✅ REQUIRED
+        return
 
-    # Try to prefill from lock file if present
+    # ------------------------------------------------------------
+    # PREFILL FROM LOCK FILE
+    # ------------------------------------------------------------
     lock = load_license_lock() or {}
     default_customer = lock.get("customer_name", "")
     default_key = lock.get("license_key", "")
@@ -503,12 +509,15 @@ def license_activation_screen():
 
     st.markdown(
         "<p style='font-size:0.9rem;color:#9ca3af;'>"
-        "Hint: The license key is generated using your customer name and expiry month/year. "
-        "Both must match exactly (spacing & spelling included)."
+        "The license key is generated using Customer Name + Expiry Month/Year. "
+        "Both must match exactly."
         "</p>",
         unsafe_allow_html=True,
     )
 
+    # ------------------------------------------------------------
+    # ACTIVATE
+    # ------------------------------------------------------------
     if st.button("🔓 Activate License", width="stretch"):
         name_clean = customer_name.strip()
         key_clean = license_key.strip().upper()
@@ -520,23 +529,27 @@ def license_activation_screen():
         try:
             exp_year = int(expiry_year)
             exp_month = int(expiry_month)
-            if exp_month < 1 or exp_month > 12:
+            if not (1 <= exp_month <= 12):
                 raise ValueError("Invalid month")
 
             expected_key = generate_license_key(name_clean, exp_year, exp_month)
-
             if key_clean != expected_key:
-                st.error("❌ Invalid license key for this customer and expiry. Please check and try again.")
+                st.error("❌ Invalid license key for this customer and expiry.")
                 return
 
-            # Compute expiry date as last day of the month
+            # Expiry = last day of month
             last_day = calendar.monthrange(exp_year, exp_month)[1]
             expires_on = date(exp_year, exp_month, last_day)
 
-            # Insert into DB
+            # ----------------------------------------------------
+            # 🔥 ENSURE SINGLE LICENSE ROW
+            # ----------------------------------------------------
+            execute("DELETE FROM license")
+
             execute(
                 """
-                INSERT INTO license (license_key, customer_name, expires_on, created_at, last_run_date)
+                INSERT INTO license
+                (license_key, customer_name, expires_on, created_at, last_run_date)
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (
@@ -548,7 +561,6 @@ def license_activation_screen():
                 ),
             )
 
-            # Save external lock file (anti-DB-delete guard)
             save_license_lock(
                 {
                     "license_key": key_clean,
@@ -560,11 +572,13 @@ def license_activation_screen():
             st.success(
                 f"✅ License activated for **{name_clean}** until **{expires_on.isoformat()}**."
             )
-            st.info("You can now restart or refresh the app to continue to login.")
-            st.rerun()
+
+            time.sleep(0.5)
+            st.rerun()   # ✅ REQUIRED
 
         except Exception as e:
             st.error(f"Activation failed: {e}")
+
 
 def hash_password(password: str) -> str:
     """Hash a password using SHA256."""
@@ -5173,5 +5187,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
