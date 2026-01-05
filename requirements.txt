@@ -1,0 +1,8 @@
+streamlit
+pandas
+websockets
+streamlit-autorefresh
+qrcode
+pillow
+fpdf
+stripe
