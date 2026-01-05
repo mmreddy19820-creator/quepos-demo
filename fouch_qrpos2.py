@@ -746,19 +746,17 @@ def init_db():
         )
     """)
 
-    # ============================================================
-    # LICENSE TABLE
-    # ============================================================
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS license (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            license_key TEXT,
-            customer_name TEXT,
-            expires_on TEXT,
-            created_at TEXT,
-            last_run_date TEXT
-        )
-    """)
+   # ====================================================
+    # 🔧 LICENSE TABLE MIGRATION (STREAMLIT CLOUD SAFE)
+    # ====================================================
+    cur.execute("PRAGMA table_info(license)")
+    cols = [r["name"] for r in cur.fetchall()]
+
+    if "machine_id" not in cols:
+        cur.execute("ALTER TABLE license ADD COLUMN machine_id TEXT")
+
+    conn.commit()
+    conn.close()
 
     # ============================================================
     # BUSINESS PROFILE (SAFE + CURRENCY LOCK)
@@ -5197,3 +5195,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
