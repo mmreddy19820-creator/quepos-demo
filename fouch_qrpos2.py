@@ -629,17 +629,15 @@ def logout():
 # -------------------------------------------------------------------
 
 def init_db():
+
     conn = get_conn()
     c = conn.cursor()
 
     # ============================================================
     # SQLITE SAFETY / PERFORMANCE PRAGMAS (WAL MODE)
     # ============================================================
-    # ✅ WAL = better concurrency and crash safety
     c.execute("PRAGMA journal_mode=WAL;")
-    # ✅ NORMAL is good balance between durability & speed
     c.execute("PRAGMA synchronous=NORMAL;")
-    # ✅ Avoid 'database is locked' errors under light contention
     c.execute("PRAGMA busy_timeout=5000;")
 
     # ============================================================
@@ -695,7 +693,7 @@ def init_db():
     """)
 
     # ============================================================
-    # ORDER ITEMS
+    # ORDER ITEMS TABLE
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS order_items (
@@ -713,7 +711,7 @@ def init_db():
     """)
 
     # ============================================================
-    # PAYMENTS TABLE  ✅ ADD tax_amount COLUMN (ONE COLUMN SOLUTION)
+    # PAYMENTS TABLE
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS payments (
@@ -721,20 +719,18 @@ def init_db():
             order_id TEXT,
             method TEXT,
             amount REAL,
-            tax_amount REAL DEFAULT 0,   -- ✅ NEW: tax captured at payment time
+            tax_amount REAL DEFAULT 0,
             created_at TEXT,
             FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
         )
     """)
 
-    # ✅ Ensure required column exists even if table already existed
     c.execute("PRAGMA table_info(payments)")
-    pay_cols = [row[1] for row in c.fetchall()]
-    if "tax_amount" not in pay_cols:
+    if "tax_amount" not in [r[1] for r in c.fetchall()]:
         c.execute("ALTER TABLE payments ADD COLUMN tax_amount REAL DEFAULT 0")
 
     # ============================================================
-    # KDS ITEMS STATUS TABLE
+    # KDS ITEMS STATUS
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS kds_items_status (
@@ -746,20 +742,35 @@ def init_db():
         )
     """)
 
-   # ====================================================
-    # 🔧 LICENSE TABLE MIGRATION (STREAMLIT CLOUD SAFE)
-    # ====================================================
-    cur.execute("PRAGMA table_info(license)")
-    cols = [r["name"] for r in cur.fetchall()]
+    # ============================================================
+    # LICENSE TABLE (CLOUD + LOCAL SAFE)
+    # ============================================================
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS license (
+            id TEXT PRIMARY KEY,
+            license_key TEXT,
+            customer_name TEXT,
+            expires_on TEXT,
+            is_expired INTEGER DEFAULT 0,
+            last_run_date TEXT,
+            machine_id TEXT
+        )
+    """)
 
-    if "machine_id" not in cols:
-        cur.execute("ALTER TABLE license ADD COLUMN machine_id TEXT")
+    c.execute("PRAGMA table_info(license)")
+    lic_cols = [r[1] for r in c.fetchall()]
 
-    conn.commit()
-    conn.close()
+    if "machine_id" not in lic_cols:
+        c.execute("ALTER TABLE license ADD COLUMN machine_id TEXT")
+
+    if "last_run_date" not in lic_cols:
+        c.execute("ALTER TABLE license ADD COLUMN last_run_date TEXT")
+
+    if "is_expired" not in lic_cols:
+        c.execute("ALTER TABLE license ADD COLUMN is_expired INTEGER DEFAULT 0")
 
     # ============================================================
-    # BUSINESS PROFILE (SAFE + CURRENCY LOCK)
+    # BUSINESS PROFILE
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS business_profile (
@@ -768,21 +779,12 @@ def init_db():
             address TEXT,
             phone TEXT,
             vat_no TEXT,
-            closing_line TEXT
+            closing_line TEXT,
+            currency TEXT DEFAULT 'GBP',
+            currency_locked INTEGER DEFAULT 0
         )
     """)
 
-    # 🔒 ENSURE REQUIRED COLUMNS (NO CRASH EVER)
-    c.execute("PRAGMA table_info(business_profile)")
-    existing_cols = [row[1] for row in c.fetchall()]
-
-    if "currency" not in existing_cols:
-        c.execute("ALTER TABLE business_profile ADD COLUMN currency TEXT DEFAULT 'GBP'")
-
-    if "currency_locked" not in existing_cols:
-        c.execute("ALTER TABLE business_profile ADD COLUMN currency_locked INTEGER DEFAULT 0")
-
-    # Ensure single row
     c.execute("""
         INSERT OR IGNORE INTO business_profile
         (id, business_name, currency, currency_locked)
@@ -808,35 +810,10 @@ def init_db():
         AFTER INSERT ON order_items
         BEGIN
             UPDATE orders
-            SET status='in_progress',
-                updated_at=datetime('now')
+            SET status='in_progress', updated_at=datetime('now')
             WHERE id = NEW.order_id
               AND status='pending'
               AND order_type IN ('dine','takeaway','qr');
-        END;
-    """)
-
-    c.execute("DROP TRIGGER IF EXISTS auto_ready_order;")
-    c.execute("""
-        CREATE TRIGGER auto_ready_order
-        AFTER UPDATE OF status ON kds_items_status
-        WHEN NEW.status = 'done'
-        BEGIN
-            UPDATE orders
-            SET status = 'ready',
-                updated_at = datetime('now')
-            WHERE id = (
-                SELECT order_id FROM order_items WHERE id = NEW.order_item_id
-            )
-            AND NOT EXISTS (
-                SELECT 1
-                FROM kds_items_status ks
-                JOIN order_items oi ON oi.id = ks.order_item_id
-                WHERE oi.order_id = (
-                    SELECT order_id FROM order_items WHERE id = NEW.order_item_id
-                )
-                AND ks.status != 'done'
-            );
         END;
     """)
 
@@ -870,9 +847,10 @@ def init_db():
             "superadmin",
             full_modules
         ))
-        print("✔ Default superadmin created: admin / admin123")
 
     conn.commit()
+    conn.close()
+
 
 # -------------------------------------------------------------------
 # ORDER HELPERS
@@ -5195,4 +5173,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
