@@ -4933,9 +4933,28 @@ def main():
     )
 
     # ============================================================
+    # 🔓 PUBLIC QR ACCESS (MUST RUN FIRST – NO LICENSE / LOGIN)
+    # ============================================================
+    try:
+        params = st.query_params
+    except Exception:
+        params = st.experimental_get_query_params()
+
+    qr_val = params.get("qr")
+    table_val = params.get("table")
+
+    if isinstance(qr_val, list):
+        qr_val = qr_val[0]
+    if isinstance(table_val, list):
+        table_val = table_val[0]
+
+    if qr_val == "1" and table_val:
+        qr_order_page(table_val)
+        st.stop()   # ⛔ stop everything else (NO license, NO login)
+
+    # ============================================================
     # 🔷 GLOBAL NEON BRANDING (ALL PAGES – SAFE)
     # ============================================================
-    profile = None
     try:
         profile = get_business_profile()
     except Exception:
@@ -4950,11 +4969,9 @@ def main():
         font-weight: 900 !important;
         letter-spacing: -0.5px;
     }}
-
     .nav-col h1, .nav-col h2, .nav-col h3 {{
         color: #1F4ED8 !important;
     }}
-
     .qpos-brand-global {{
         position: fixed;
         top: 14px;
@@ -4972,37 +4989,16 @@ def main():
             0 0 28px rgba(0,229,255,0.6);
     }}
     </style>
-
     <div class="qpos-brand-global">{brand_name}</div>
     """, unsafe_allow_html=True)
-
-    # ============================================================
-    # PUBLIC QR PAGE
-    # ============================================================
-    try:
-        params = st.query_params
-    except Exception:
-        params = st.experimental_get_query_params()
-
-    qr_val = params.get("qr")
-    table_val = params.get("table")
-
-    if isinstance(qr_val, list):
-        qr_val = qr_val[0]
-    if isinstance(table_val, list):
-        table_val = table_val[0]
-
-    if qr_val == "1" and table_val:
-        qr_order_page(table_val)
-        st.stop()
 
     # ============================================================
     # INIT SYSTEMS
     # ============================================================
     if not getattr(sys, "frozen", False):
         if "ws_started" not in st.session_state:
-             start_ws_listener()
-             st.session_state["ws_started"] = True
+            start_ws_listener()
+            st.session_state["ws_started"] = True
 
     init_db()
 
@@ -5049,10 +5045,10 @@ def main():
     show_expiry_warning_if_needed(active_license)
 
     # ============================================================
-    # LOGIN
+    # LOGIN (NO DOUBLE FORM)
     # ============================================================
     if "user" not in st.session_state:
-        with st.form("login"):
+        with st.form("login", clear_on_submit=True):
             username = st.text_input("Username")
             password = st.text_input("Password", type="password")
             if st.form_submit_button("Login"):
@@ -5111,12 +5107,7 @@ def main():
         for mod in visible_modules:
             is_active = st.session_state["active_page"] == mod
             btn_type = "primary" if is_active else "secondary"
-
-            if st.button(
-                mod,
-                type=btn_type,
-                width="stretch",
-            ):
+            if st.button(mod, type=btn_type, width="stretch"):
                 st.session_state["active_page"] = mod
                 st.rerun()
 
@@ -5153,8 +5144,10 @@ def main():
             admin_panel()
 
 
+
 if __name__ == "__main__":
     main()
+
 
 
 
