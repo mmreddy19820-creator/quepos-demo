@@ -643,19 +643,18 @@ def logout():
 # -------------------------------------------------------------------
 
 def init_db():
-
     conn = get_conn()
     c = conn.cursor()
 
     # ============================================================
-    # SQLITE SAFETY / PERFORMANCE PRAGMAS (WAL MODE)
+    # SQLITE SAFETY / PERFORMANCE PRAGMAS
     # ============================================================
     c.execute("PRAGMA journal_mode=WAL;")
     c.execute("PRAGMA synchronous=NORMAL;")
     c.execute("PRAGMA busy_timeout=5000;")
 
     # ============================================================
-    # USERS TABLE
+    # USERS
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -669,7 +668,7 @@ def init_db():
     """)
 
     # ============================================================
-    # MENU TABLE
+    # MENU
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS menu (
@@ -685,7 +684,7 @@ def init_db():
     """)
 
     # ============================================================
-    # ORDERS TABLE
+    # ORDERS
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS orders (
@@ -707,7 +706,7 @@ def init_db():
     """)
 
     # ============================================================
-    # ORDER ITEMS TABLE
+    # ORDER ITEMS
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS order_items (
@@ -725,7 +724,7 @@ def init_db():
     """)
 
     # ============================================================
-    # PAYMENTS TABLE
+    # PAYMENTS
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS payments (
@@ -744,7 +743,7 @@ def init_db():
         c.execute("ALTER TABLE payments ADD COLUMN tax_amount REAL DEFAULT 0")
 
     # ============================================================
-    # KDS ITEMS STATUS
+    # KDS STATUS
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS kds_items_status (
@@ -757,11 +756,11 @@ def init_db():
     """)
 
     # ============================================================
-    # LICENSE TABLE (CLOUD + LOCAL SAFE)
+    # LICENSE (CRITICAL)
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS license (
-            id TEXT PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             license_key TEXT,
             customer_name TEXT,
             expires_on TEXT,
@@ -824,7 +823,8 @@ def init_db():
         AFTER INSERT ON order_items
         BEGIN
             UPDATE orders
-            SET status='in_progress', updated_at=datetime('now')
+            SET status='in_progress',
+                updated_at=datetime('now')
             WHERE id = NEW.order_id
               AND status='pending'
               AND order_type IN ('dine','takeaway','qr');
@@ -5187,6 +5187,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
