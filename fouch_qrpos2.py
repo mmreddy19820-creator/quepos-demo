@@ -3654,109 +3654,191 @@ def render_touch_category_bar(menu_items, context: str) -> str:
 
     return active
 
-def render_touch_item_grid(order_id, menu_items, context):
-    # ------------------------------------------------------------
-    # 🌍 DISPLAY CONTEXT (SAFE – NO LOGIC CHANGE)
-    # ------------------------------------------------------------
-    symbol = st.session_state.get("currency_symbol", "£")
-
-    active_cat = st.session_state.get(f"active_cat_{context}", "Other")
-    filtered = [m for m in menu_items if (m.get("category") or "Other") == active_cat]
-
-    if not filtered:
-        st.info("No items in this category")
+def render_touch_cart(order_id: str, context: str):
+    order = fetchone("SELECT * FROM orders WHERE id=?", (order_id,))
+    if not order:
+        st.error("Order not found")
         return
 
-    st.markdown('<div class="item-grid">', unsafe_allow_html=True)
+    items = fetchall(
+        "SELECT * FROM order_items WHERE order_id=? ORDER BY created_at",
+        (order_id,),
+    )
 
-    # 4 items per row (touch-friendly)
-    for i in range(0, len(filtered), 4):
-        cols = st.columns(4)
-        row = filtered[i:i + 4]
+    symbol = st.session_state.get("currency_symbol", "£")
 
-        for j, it in enumerate(row):
-            with cols[j]:
-                # ✅ FIX: dynamic currency symbol (DISPLAY ONLY)
-                label = f"{it['name']}\n{symbol}{it['price']:.2f}"
-
-                if st.button(
-                    label,
-                    key=f"item_{context}_{order_id}_{it['id']}",
-                    width="stretch",   # ✅ FIX (2026-safe)
-                ):
-                    # =====================================================
-                    # ✅ CREATE TAKEAWAY ORDER ON FIRST ITEM ONLY
-                    # =====================================================
-                    if context == "tky" and not order_id:
-                        order_id = create_order(
-                            "takeaway",
-                            table_no=None,
-                            customer_name=None,
-                            paid=False,
-                        )
-                        st.session_state["open_takeaway_order_id"] = order_id
-
-                    # POS-grade safety check
-                    if not order_id:
-                        st.error("Order not initialised")
-                        return
-
-                    add_order_item(order_id, it, 1, "")
-                    st.rerun()
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # 🔒 UNIFORM ITEM BUTTON SIZE (POS SAFE)
+    # ============================================================
+    # 🎨 ULTRA-COMPACT CART STYLE (INVENTORY-LIKE)
+    # ============================================================
     st.markdown("""
     <style>
-    .item-grid button {
-        background: linear-gradient(145deg, #fff7ed, #ffedd5) !important;
-        color: #111 !important;
-        border-radius: 16px !important;
-        border: 2px solid #fb923c !important;
-
-        height: 110px !important;
-        min-height: 110px !important;
-        max-height: 110px !important;
-
-        display: flex !important;
-        flex-direction: column !important;
-        justify-content: center !important;
-        align-items: center !important;
-
-        text-align: center !important;
-        white-space: pre-line !important;
-        line-height: 1.2 !important;
-
-        font-size: 1.1rem !important;
-        font-weight: 700 !important;
-        padding: 10px !important;
-
-        box-shadow: 0 4px 14px rgba(0,0,0,0.15);
-        transition: all 0.2s ease;
+    .cart-header {
+        font-size: 1rem;
+        font-weight: 800;
+        margin-bottom: 6px;
     }
-
-    .item-grid button > div {
-        width: 100% !important;
-        text-align: center !important;
+    .cart-row {
+        display: grid;
+        grid-template-columns: 1fr auto auto;
+        gap: 6px;
+        align-items: center;
+        padding: 3px 0;
+        border-bottom: 1px solid rgba(255,255,255,0.05);
+        font-size: 0.9rem;
     }
-
-    .item-grid button:hover {
-        background: linear-gradient(145deg, #fb923c, #f97316) !important;
-        color: white !important;
-        transform: scale(1.05);
+    .cart-name {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
     }
-
-    @media (max-width: 1024px) {
-        .item-grid button {
-            height: 95px !important;
-            min-height: 95px !important;
-            max-height: 95px !important;
-            font-size: 1rem !important;
-        }
+    .pill {
+        background: rgba(34,197,94,0.15);
+        color: #22c55e;
+        padding: 1px 6px;
+        border-radius: 6px;
+        font-size: 0.75rem;
+        font-weight: 600;
+    }
+    .kds-pill {
+        background:#374151;
+        color:#e5e7eb;
+        font-size:0.65rem;
+        padding:1px 5px;
+        border-radius:5px;
+        margin-top:2px;
+        width:fit-content;
+    }
+    .remove-btn button {
+        background:none !important;
+        border:none !important;
+        padding:0 !important;
+        color:#ef4444 !important;
+        font-weight:900 !important;
+    }
+    .cart-total {
+        margin-top: 6px;
+        font-size: 1.1rem;
+        font-weight: 900;
     }
     </style>
     """, unsafe_allow_html=True)
+
+    # ============================================================
+    # HEADER
+    # ============================================================
+    label = order.get("table_no") or order.get("token") or order_id[:8]
+    status = (order.get("status") or "").upper()
+
+    st.markdown(
+        f"<div class='cart-header'>Order <b>{label}</b> "
+        f"<span style='font-size:0.7rem;color:#9ca3af;'>[{status}]</span></div>",
+        unsafe_allow_html=True,
+    )
+
+    # ============================================================
+    # ITEMS (MAX DENSITY LIST)
+    # ============================================================
+    if not items:
+        st.info("No items yet.")
+    else:
+        for it in items:
+            qty = int(it["qty"])
+            base = qty * it["unit_price"]
+            tax_val = base * (it["tax"] / 100)
+            line_total = base + tax_val
+
+            kds = fetchone(
+                "SELECT status FROM kds_items_status WHERE order_item_id=?",
+                (it["id"],),
+            )
+            kds_status = (kds["status"] if kds else "pending").upper()
+
+            st.markdown(
+                f"""
+                <div class="cart-row">
+                    <div class="cart-name">
+                        {it['name']}
+                        <div class="kds-pill">{kds_status}</div>
+                    </div>
+                    <div class="pill">x{qty}</div>
+                    <div class="pill">{symbol}{line_total:.2f}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            # ✖ remove (only button kept)
+            cols = st.columns([10, 1])
+            with cols[1]:
+                if st.button("✖", key=f"rm_{context}_{it['id']}"):
+                    execute("DELETE FROM order_items WHERE id=?", (it["id"],))
+                    recalc_order_total(order_id)
+                    push_realtime_event("order_updated", {"order_id": order_id})
+                    st.rerun()
+
+    # ============================================================
+    # TOTAL
+    # ============================================================
+    totals_row = fetchone("SELECT total, tax FROM orders WHERE id=?", (order_id,))
+    order_total = float((totals_row or {}).get("total") or 0.0)
+    order_tax = float((totals_row or {}).get("tax") or 0.0)
+
+    st.markdown(
+        f"<div class='cart-total'>Total: {symbol}{order_total:.2f}</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ============================================================
+    # 🧾 PRINT BILL
+    # ============================================================
+    if context == "dine" and order_total > 0:
+        if st.button("🖨️ Print / Show Bill", width="stretch"):
+            st.session_state["__bill_to_show__"] = order_id
+
+    # ============================================================
+    # 🍽️ / 🥡 PAYMENTS (UNCHANGED LOGIC)
+    # ============================================================
+    if order_total > 0:
+        st.markdown("### 💳 Payment")
+        method = st.radio(
+            "Method",
+            ["Cash", "Card"],
+            horizontal=True,
+            key=f"{context}_pay_method_{order_id}",
+        )
+
+        if st.button("✅ Confirm Payment", width="stretch"):
+            already_paid = fetchone(
+                "SELECT paid FROM orders WHERE id=?", (order_id,)
+            )["paid"]
+
+            if already_paid:
+                st.warning("⚠️ Order already paid.")
+                return
+
+            execute(
+                """
+                INSERT INTO payments (id, order_id, method, amount, tax_amount, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    order_id,
+                    method,
+                    order_total,
+                    order_tax,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+            execute(
+                "UPDATE orders SET paid=1, updated_at=? WHERE id=?",
+                (datetime.now(timezone.utc).isoformat(), order_id),
+            )
+
+            st.success("💰 Payment recorded.")
+            st.rerun()
+
 
 def recalc_order_total(order_id: str):
     items = fetchall(
@@ -5203,6 +5285,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
