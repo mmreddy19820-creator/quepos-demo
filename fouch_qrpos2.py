@@ -3798,7 +3798,6 @@ def recalc_order_total(order_id: str):
         ),
     )
 
-
 def render_touch_cart(order_id: str, context: str):
     order = fetchone("SELECT * FROM orders WHERE id=?", (order_id,))
     if not order:
@@ -3813,48 +3812,60 @@ def render_touch_cart(order_id: str, context: str):
     active_item_id = st.session_state.get("active_cart_item_id")
 
     # ============================================================
-    # 🌍 DISPLAY CONTEXT (SAFE GLOBALS)
+    # 🌍 DISPLAY CONTEXT
     # ============================================================
     symbol = st.session_state.get("currency_symbol", "£")
-    tax_label = st.session_state.get("tax_label", "VAT")
 
     # ============================================================
-    # STYLES
+    # 🎨 SIMPLE INVENTORY-STYLE CART CSS
     # ============================================================
     st.markdown("""
     <style>
-    .cart-row {
-        background:#f9fafb;
-        border:1px solid #e5e7eb;
-        border-radius:10px;
-        padding:12px 14px;
-        margin-bottom:6px;
-        font-size:0.95rem;
-        color:#111827;
-    }
-    .cart-row-active {
-        background:#f3f4f6;
-        border:2px solid #9ca3af;
-    }
     .cart-header {
-        font-size:1.1rem;
-        font-weight:800;
-        margin-bottom:10px;
+        font-size: 1.05rem;
+        font-weight: 800;
+        margin-bottom: 10px;
+    }
+    .cart-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 6px 2px;
+        border-bottom: 1px solid rgba(255,255,255,0.06);
+        font-size: 0.95rem;
+    }
+    .cart-name {
+        font-weight: 500;
+    }
+    .cart-pill {
+        background: rgba(34,197,94,0.15);
+        color: #22c55e;
+        padding: 2px 8px;
+        border-radius: 8px;
+        font-size: 0.85rem;
+        font-weight: 600;
+        margin-left: 6px;
+    }
+    .cart-remove button {
+        background: none !important;
+        color: #ef4444 !important;
+        font-weight: 800 !important;
+        border: none !important;
+        padding: 0 !important;
     }
     .cart-total {
-        font-size:1.25rem;
-        font-weight:900;
-        margin-top:10px;
+        margin-top: 10px;
+        font-size: 1.15rem;
+        font-weight: 900;
     }
-    .kds-badge {
-        font-size:0.7rem;
-        color:white;
-        background:#6b7280;
-        padding:3px 6px;
-        border-radius:6px;
-        width:fit-content;
-        margin-top:2px;
-        margin-bottom:6px;
+    .kds-pill {
+        font-size: 0.7rem;
+        padding: 2px 6px;
+        border-radius: 6px;
+        background: #374151;
+        color: #e5e7eb;
+        margin-top: 2px;
+        width: fit-content;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -3867,58 +3878,60 @@ def render_touch_cart(order_id: str, context: str):
 
     st.markdown(
         f"<div class='cart-header'>Order <b>{label}</b> "
-        f"<span style='font-size:0.8rem;color:#6b7280;'>[{status}]</span></div>",
+        f"<span style='font-size:0.75rem;color:#9ca3af;'>[{status}]</span></div>",
         unsafe_allow_html=True,
     )
 
     # ============================================================
-    # ITEMS
+    # ITEMS (SIMPLE LIST)
     # ============================================================
     if not items:
         st.info("No items yet.")
     else:
         for it in items:
-            is_active = active_item_id == it["id"]
             qty = int(it["qty"])
             base = qty * it["unit_price"]
             tax_val = base * (it["tax"] / 100)
             line_total = base + tax_val
 
-            row_class = "cart-row cart-row-active" if is_active else "cart-row"
-            label_txt = f"{html.escape(it['name'])} ×{qty} {symbol}{line_total:.2f}"
+            c1, c2, c3 = st.columns([6, 2, 1])
 
-            with st.container():
-                col_label, col_x = st.columns([8, 1])
+            with c1:
+                if st.button(
+                    f"{it['name']}",
+                    key=f"row_{context}_{it['id']}",
+                ):
+                    st.session_state["active_cart_item_id"] = it["id"]
+                    st.rerun()
 
-                with col_label:
-                    if st.button(
-                        label_txt,
-                        key=f"row_{context}_{it['id']}",
-                        width="stretch",
-                    ):
-                        st.session_state["active_cart_item_id"] = it["id"]
-                        st.rerun()
+                kds = fetchone(
+                    "SELECT status FROM kds_items_status WHERE order_item_id=?",
+                    (it["id"],),
+                )
+                kds_status = (kds["status"] if kds else "pending").upper()
+                st.markdown(
+                    f"<div class='kds-pill'>{kds_status}</div>",
+                    unsafe_allow_html=True,
+                )
 
-                with col_x:
-                    if st.button("✖", key=f"rm_{context}_{it['id']}"):
-                        execute("DELETE FROM order_items WHERE id=?", (it["id"],))
-                        recalc_order_total(order_id)
-                        push_realtime_event("order_updated", {"order_id": order_id})
-                        if st.session_state.get("active_cart_item_id") == it["id"]:
-                            st.session_state.pop("active_cart_item_id", None)
-                        st.rerun()
+            with c2:
+                st.markdown(
+                    f"<span class='cart-pill'>x{qty}</span>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f"<span class='cart-pill'>{symbol}{line_total:.2f}</span>",
+                    unsafe_allow_html=True,
+                )
 
-            st.markdown(f"<div class='{row_class}'></div>", unsafe_allow_html=True)
-
-            kds = fetchone(
-                "SELECT status FROM kds_items_status WHERE order_item_id=?",
-                (it["id"],),
-            )
-            kds_status = (kds["status"] if kds else "pending").upper()
-            st.markdown(
-                f"<div class='kds-badge'>{kds_status}</div>",
-                unsafe_allow_html=True,
-            )
+            with c3:
+                if st.button("✖", key=f"rm_{context}_{it['id']}"):
+                    execute("DELETE FROM order_items WHERE id=?", (it["id"],))
+                    recalc_order_total(order_id)
+                    push_realtime_event("order_updated", {"order_id": order_id})
+                    if st.session_state.get("active_cart_item_id") == it["id"]:
+                        st.session_state.pop("active_cart_item_id", None)
+                    st.rerun()
 
     # ============================================================
     # TOTAL
@@ -3926,7 +3939,6 @@ def render_touch_cart(order_id: str, context: str):
     totals_row = fetchone("SELECT total, tax, paid FROM orders WHERE id=?", (order_id,))
     order_total = float((totals_row or {}).get("total") or 0.0)
     order_tax = float((totals_row or {}).get("tax") or 0.0)
-    order_paid_flag = int((totals_row or {}).get("paid") or 0)
 
     st.markdown(
         f"<div class='cart-total'>Total: {symbol}{order_total:.2f}</div>",
@@ -3934,22 +3946,17 @@ def render_touch_cart(order_id: str, context: str):
     )
 
     # ============================================================
-    # 🧾 PRINT BILL (BEFORE PAYMENT) — DINE-IN ONLY
+    # 🧾 PRINT BILL (DINE-IN)
     # ============================================================
     if context == "dine" and order_total > 0:
-        if st.button(
-            "🖨️ Print / Show Bill",
-            key=f"print_bill_{order_id}",
-            width="stretch",
-        ):
+        if st.button("🖨️ Print / Show Bill", key=f"print_bill_{order_id}", width="stretch"):
             st.session_state["__bill_to_show__"] = order_id
 
     # ============================================================
-    # 🍽️ DINE-IN PAYMENT + CLOSE TABLE
+    # 🍽️ DINE-IN PAYMENT
     # ============================================================
     if context == "dine" and order_total > 0:
         st.markdown("### 💳 Payment")
-
         method = st.radio(
             "Method",
             ["Cash", "Card"],
@@ -3957,11 +3964,7 @@ def render_touch_cart(order_id: str, context: str):
             key=f"dine_pay_method_{order_id}",
         )
 
-        if st.button(
-            "✅ Confirm Payment",
-            key=f"dine_confirm_{order_id}",
-            width="stretch",
-        ):
+        if st.button("✅ Confirm Payment", key=f"dine_confirm_{order_id}", width="stretch"):
             already_paid = fetchone(
                 "SELECT paid FROM orders WHERE id=?", (order_id,)
             )["paid"]
@@ -3969,9 +3972,6 @@ def render_touch_cart(order_id: str, context: str):
             if already_paid:
                 st.warning("⚠️ Order already paid.")
             else:
-                normalized_method = "Cash" if "cash" in method.lower() else "Card"
-
-                # ✅ Store tax_amount into payments (new column)
                 execute(
                     """
                     INSERT INTO payments (id, order_id, method, amount, tax_amount, created_at)
@@ -3980,34 +3980,25 @@ def render_touch_cart(order_id: str, context: str):
                     (
                         str(uuid.uuid4()),
                         order_id,
-                        normalized_method,
+                        method,
                         order_total,
                         order_tax,
                         datetime.now(timezone.utc).isoformat(),
                     ),
                 )
-
                 execute(
                     "UPDATE orders SET paid=1, updated_at=? WHERE id=?",
                     (datetime.now(timezone.utc).isoformat(), order_id),
                 )
-
                 st.success("💰 Payment recorded.")
                 st.rerun()
 
-        # ✅ CLOSE TABLE ONLY IF PAID
-        if st.button(
-            "🧾 Close Table",
-            key=f"dine_close_{order_id}",
-            width="stretch",
-        ):
-            # Re-check from DB to be 100% sure
+        if st.button("🧾 Close Table", key=f"dine_close_{order_id}", width="stretch"):
             paid_chk = fetchone(
                 "SELECT paid FROM orders WHERE id=?", (order_id,)
             )["paid"]
-
             if not paid_chk:
-                st.error("❌ Cannot close table before payment. Please confirm payment first.")
+                st.error("❌ Cannot close table before payment.")
             else:
                 execute(
                     "UPDATE orders SET status='closed', updated_at=? WHERE id=?",
@@ -4023,7 +4014,6 @@ def render_touch_cart(order_id: str, context: str):
     # ============================================================
     if context == "tky" and order_total > 0:
         st.markdown("### 💳 Payment")
-
         method = st.radio(
             "Method",
             ["Cash", "Card"],
@@ -4031,22 +4021,14 @@ def render_touch_cart(order_id: str, context: str):
             key=f"tky_pay_method_{order_id}",
         )
 
-        if st.button(
-            "✅ Confirm Payment",
-            key=f"tky_confirm_{order_id}",
-            width="stretch",
-        ):
+        if st.button("✅ Confirm Payment", key=f"tky_confirm_{order_id}", width="stretch"):
             already_paid = fetchone(
                 "SELECT paid FROM orders WHERE id=?", (order_id,)
             )["paid"]
-
             if already_paid:
                 st.warning("⚠️ Order already paid.")
                 return
 
-            normalized_method = "Cash" if "cash" in method.lower() else "Card"
-
-            # ✅ Store tax_amount into payments (new column)
             execute(
                 """
                 INSERT INTO payments (id, order_id, method, amount, tax_amount, created_at)
@@ -4055,7 +4037,7 @@ def render_touch_cart(order_id: str, context: str):
                 (
                     str(uuid.uuid4()),
                     order_id,
-                    normalized_method,
+                    method,
                     order_total,
                     order_tax,
                     datetime.now(timezone.utc).isoformat(),
@@ -4066,11 +4048,7 @@ def render_touch_cart(order_id: str, context: str):
                 """
                 UPDATE orders
                 SET paid=1,
-                    status = CASE
-                        WHEN order_type='takeaway' AND status='pending'
-                        THEN 'in_progress'
-                        ELSE status
-                    END,
+                    status='in_progress',
                     updated_at=?
                 WHERE id=?
                 """,
@@ -5225,6 +5203,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
