@@ -25,13 +25,172 @@ import sqlite3
 import webbrowser
 import time
 import os
+import requests
+from streamlit_autorefresh import st_autorefresh
+
+
 
 os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
 os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
 os.environ["STREAMLIT_SERVER_PORT"] = "8501"
 os.environ["STREAMLIT_SERVER_ADDRESS"] = "localhost"
 
+# -------------------------------------------------------------------
+# APP META / TELEMETRY HELPERS (SAFE, ANONYMOUS)
+# -------------------------------------------------------------------
 
+def ensure_app_meta_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    conn.commit()
+
+def get_meta(key):
+    row = fetchone("SELECT value FROM app_meta WHERE key = ?", (key,))
+    return row["value"] if row else None
+
+
+def set_meta(key, value):
+    execute(
+        "INSERT OR REPLACE INTO app_meta (key, value) VALUES (?, ?)",
+        (key, str(value))
+    )
+
+def get_or_create_restaurant_id():
+    rid = get_meta("restaurant_id")
+    if rid:
+        return rid
+
+    rid = f"QUEPOS-{uuid.uuid4().hex[:8].upper()}"
+    set_meta("restaurant_id", rid)
+    return rid
+
+def daily_business_stats(conn):
+    """
+    Returns today's business KPIs (local day):
+    - total_sales_today
+    - dine_in_orders
+    - takeaway_orders
+    - qr_orders
+    - avg_order_value
+
+    Sales are based on actual payments received.
+    """
+    cur = conn.cursor()
+
+    # Total sales today (actual money received)
+    cur.execute("""
+        SELECT COALESCE(SUM(amount), 0)
+        FROM payments
+        WHERE date(created_at, 'localtime') = date('now', 'localtime')
+    """)
+    total_sales_today = float(cur.fetchone()[0] or 0.0)
+
+    # Order counts by type created today
+    cur.execute("""
+        SELECT
+          SUM(CASE WHEN order_type='dine' THEN 1 ELSE 0 END),
+          SUM(CASE WHEN order_type='takeaway' THEN 1 ELSE 0 END),
+          SUM(CASE WHEN order_type='qr' THEN 1 ELSE 0 END)
+        FROM orders
+        WHERE date(created_at, 'localtime') = date('now', 'localtime')
+    """)
+    row = cur.fetchone() or (0, 0, 0)
+    dine_in = int(row[0] or 0)
+    takeaway = int(row[1] or 0)
+    qr = int(row[2] or 0)
+
+    # Average order value (based on paid orders today)
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM payments
+        WHERE date(created_at, 'localtime') = date('now', 'localtime')
+    """)
+    paid_orders_today = int(cur.fetchone()[0] or 0)
+
+    avg_order_value = (
+        round(total_sales_today / paid_orders_today, 2)
+        if paid_orders_today > 0 else 0.0
+    )
+
+    return {
+        "total_sales_today": round(total_sales_today, 2),
+        "dine_in_orders": dine_in,
+        "takeaway_orders": takeaway,
+        "qr_orders": qr,
+        "avg_order_value": avg_order_value,
+    }
+
+
+def should_send_heartbeat():
+    today = date.today().isoformat()
+    last = get_meta("last_heartbeat_date")
+
+    if last == today:
+        return False
+
+    set_meta("last_heartbeat_date", today)
+    return True
+
+
+
+def run_heartbeat_once_per_day():
+    conn = get_conn()
+    ensure_app_meta_table(conn)
+
+    restaurant_id = get_or_create_restaurant_id()
+
+    if should_send_heartbeat():
+
+        # ✅ GET TODAY BUSINESS STATS
+        (
+            total_sales_today,
+            dine_in_count,
+            takeaway_count,
+            qr_count,
+            avg_order_value
+        ) = daily_business_stats(conn)
+
+        send_heartbeat({
+            "restaurant_id": restaurant_id,
+            "date": date.today().isoformat(),
+            "app_version": "V1.0.0",
+
+            # ✅ NEW BUSINESS METRICS
+            "total_sales_today": round(total_sales_today, 2),
+            "dine_in_orders_count": dine_in_count,
+            "takeaway_orders_count": takeaway_count,
+            "qr_orders_count": qr_count,
+            "avg_order_value": round(avg_order_value, 2),
+        })
+
+    conn.close()
+
+
+
+def usage_stats(conn):
+    cur = conn.cursor()
+
+    # Count total orders in last 30 days
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM orders
+        WHERE date(created_at) >= date('now','-30 day')
+    """)
+    orders_30 = cur.fetchone()[0]
+
+    # Count number of days POS was used in last 30 days
+    cur.execute("""
+        SELECT COUNT(DISTINCT date(created_at))
+        FROM orders
+        WHERE date(created_at) >= date('now','-30 day')
+    """)
+    days_used_30 = cur.fetchone()[0]
+
+    return orders_30, days_used_30
 
 def get_app_data_dir():
     """
@@ -116,7 +275,7 @@ def create_stripe_checkout_session(order_id: str, amount: float, currency: str =
 # BASIC CONFIG
 # -------------------------------------------------------------------
 
-LOCK_FILE = os.path.join(get_app_data_dir(), "license.lock")
+LOCK_FILE = "license.lock"
 WS_URL = "ws://localhost:8765"
 
 # -------------------------------------------------------------------
@@ -215,6 +374,31 @@ def fetchone(query: str, params: tuple = ()):
     finally:
         conn.close()
 
+# -------------------------------------------------------------------
+# HEARTBEAT / TELEMETRY
+# -------------------------------------------------------------------
+
+def send_heartbeat(data):
+    form_url = "https://docs.google.com/forms/d/e/1FAIpQLSc-Mq-D8Rl4JfLIFJm-SXdvZ_wiixot4A7j_81KxGdw819eeA/formResponse"
+
+    payload = {
+        "entry.17073871": data["restaurant_id"],
+        "entry.737231565": data["date"],
+        "entry.1388651770": data["app_version"],
+        "entry.2032538585": str(data["total_sales_today"]),
+        "entry.1579861709": str(data["dine_in_orders"]),
+        "entry.2033392908": str(data["takeaway_orders"]),
+        "entry.995635181": str(data["qr_orders"]),
+        "entry.200052208": str(data["avg_order_value"]),
+    }
+
+    try:
+        r = requests.post(form_url, data=payload, timeout=5)
+        return r.status_code == 200
+    except Exception as e:
+        print("Heartbeat failed:", e)
+        return False
+
 def get_active_table_order(table_no: str):
     """
     SINGLE active order for a table (current seating).
@@ -282,18 +466,12 @@ def generate_qr_sig(table_no: str) -> str:
 def validate_qr_sig(table_no: str, sig: str, strict: bool = False) -> bool:
     """
     Validate HMAC signature for QR link.
-
-    Supports:
-    - Legacy 12-char signatures
-    - Current HMAC-based signatures
-
-    strict=False → allow access but warn
-    strict=True  → block on mismatch
+    - strict=False (default): warn but allow if signature missing/mismatch
+    - strict=True: reject on mismatch
     """
     if not table_no:
         return False
 
-    # No signature provided
     if not sig:
         if strict:
             return False
@@ -301,31 +479,17 @@ def validate_qr_sig(table_no: str, sig: str, strict: bool = False) -> bool:
             print(f"[QR SECURITY] No signature for table {table_no}, leniently allowed.")
             return True
 
-    # Secret (safe fallback for local / cloud)
     secret = st.secrets.get("HMAC_SECRET_KEY", "default_secret")
+    expected = hmac.new(secret.encode(), table_no.encode(), hashlib.sha256).hexdigest()[:12]
 
-    # Generate expected signatures (support legacy + new)
-    expected_full = hmac.new(
-        secret.encode(),
-        table_no.encode(),
-        hashlib.sha256
-    ).hexdigest()
-
-    expected_12 = expected_full[:12]
-    expected_16 = expected_full[:16]
-
-    # Accept any known valid format
-    if sig in (expected_12, expected_16, expected_full):
+    if hmac.compare_digest(expected, sig):
         return True
-
-    # Mismatch handling
-    if strict:
+    elif strict:
         print(f"[QR SECURITY] Signature mismatch for table {table_no} — strict reject.")
         return False
     else:
         print(f"[QR SECURITY] Signature mismatch for table {table_no} — leniently allowed.")
         return True
-
 
 
 
@@ -336,38 +500,60 @@ def validate_qr_sig(table_no: str, sig: str, strict: bool = False) -> bool:
 
 @st.cache_resource
 def start_ws_listener():
-    """Start a background thread for this Streamlit session."""
+    """
+    Start ONE background WebSocket listener per app.
+    NO Streamlit calls inside thread.
+    """
     def _run():
         asyncio.run(ws_client_loop())
+
     t = threading.Thread(target=_run, daemon=True)
     t.start()
     return True
+
 
 async def ws_client_loop():
     while True:
         try:
             async with websockets.connect(WS_URL) as ws:
-                await ws.send(json.dumps({"type": "hello", "who": "pos_client"}))
+                await ws.send(json.dumps({
+                    "type": "hello",
+                    "who": "pos_client"
+                }))
+
                 async for message in ws:
                     try:
                         data = json.loads(message)
-                    except:
+                    except Exception:
                         data = {"raw": message}
+
+                    # ✅ ONLY update state — NO rerun here
                     st.session_state["__last_rt_event__"] = data
-                    st.rerun()
+
         except Exception:
             await asyncio.sleep(2)
 
 def push_realtime_event(event_type: str, payload: dict):
-    async def _send():
+    """
+    Fire-and-forget realtime event sender.
+    Safe for Streamlit + EXE.
+    """
+
+    async def _send_once():
         try:
-            async with websockets.connect(WS_URL) as ws:
-                msg = {"type": event_type, "payload": payload}
-                await ws.send(json.dumps(msg))
+            async with websockets.connect(WS_URL, open_timeout=2) as ws:
+                await ws.send(json.dumps({
+                    "type": event_type,
+                    "payload": payload
+                }))
         except Exception:
+            # silent fail is OK for realtime UX
             pass
 
-    threading.Thread(target=lambda: asyncio.run(_send()), daemon=True).start()
+    def _runner():
+        asyncio.run(_send_once())
+
+    threading.Thread(target=_runner, daemon=True).start()
 
 # -------------------------------------------------------------------
 # LICENSE HELPERS
@@ -405,16 +591,71 @@ def get_active_license():
 
 def check_license_and_date():
     """
-    Extra protection: if system date goes backwards compared to last_run_date,
-    we treat license as invalid.
+    License protection:
+    - Prevents system date rollback
+    - Locks license to a single machine
+    - Auto-adds machine_id column if missing (safe upgrade)
     """
+
+    import hashlib
+    import uuid
+    from datetime import date, datetime
+
     lic = get_active_license()
     if not lic:
         return False, "No license found. Please activate your license."
 
+    # -------------------------------------------------
+    # SAFE: Ensure machine_id column exists (ONE TIME)
+    # -------------------------------------------------
+    try:
+        execute("SELECT machine_id FROM license LIMIT 1")
+    except Exception:
+        try:
+            execute("ALTER TABLE license ADD COLUMN machine_id TEXT")
+        except Exception:
+            pass  # column already exists or locked DB
+
+        # Reload license after schema change
+        lic = get_active_license()
+
+    # -------------------------------------------------
+    # MACHINE LOCK
+    # -------------------------------------------------
+    def _get_machine_id():
+        raw = f"{uuid.getnode()}-{uuid.getnode()}"
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    current_machine_id = _get_machine_id()
+    stored_machine_id = lic.get("machine_id")
+
+    # First run → bind license to this machine
+    if not stored_machine_id:
+        try:
+            execute(
+                "UPDATE license SET machine_id=? WHERE id=?",
+                (current_machine_id, lic["id"]),
+            )
+        except Exception:
+            pass
+    else:
+        # DB copied to another machine → BLOCK
+        if stored_machine_id != current_machine_id:
+            return False, (
+                "License is locked to another computer.\n\n"
+                "This copy is not authorised.\n"
+                "Please contact support."
+            )
+
+    # -------------------------------------------------
+    # EXPIRY CHECK
+    # -------------------------------------------------
     if lic.get("is_expired"):
         return False, f"License expired on {lic.get('expires_on', '')}. Please renew."
 
+    # -------------------------------------------------
+    # DATE ROLLBACK PROTECTION
+    # -------------------------------------------------
     last_run = lic.get("last_run_date")
     today = date.today()
 
@@ -427,16 +668,23 @@ def check_license_and_date():
                     (today.isoformat(), today.isoformat(), lic["id"]),
                 )
                 return False, (
-                    "System date moved backwards.\n\n"
-                    "License locked. Please contact support for a new key."
+                    "System date manipulation detected.\n\n"
+                    "License locked. Please contact support."
                 )
         except Exception:
             pass
 
-    execute(
-        "UPDATE license SET last_run_date=? WHERE id=?",
-        (today.isoformat(), lic["id"]),
-    )
+    # -------------------------------------------------
+    # UPDATE LAST RUN (NORMAL FLOW)
+    # -------------------------------------------------
+    try:
+        execute(
+            "UPDATE license SET last_run_date=? WHERE id=?",
+            (today.isoformat(), lic["id"]),
+        )
+    except Exception:
+        pass
+
     return True, ""
 
 def show_expiry_warning_if_needed(active_license):
@@ -466,10 +714,9 @@ def license_activation_screen():
 
     • Asks for Customer Name, Expiry (Year+Month) and License Key
     • Validates using generate_license_key()
-    • Stores SINGLE license in DB
-    • Forces rerun so app proceeds correctly
+    • Saves into DB (license table) + license.lock file
+    • On success, reruns app so main() continues normally
     """
-
     st.markdown(
         "<h2 style='text-align:center;margin-bottom:0.5rem;'>Que-POS License Activation</h2>",
         unsafe_allow_html=True,
@@ -481,9 +728,7 @@ def license_activation_screen():
         unsafe_allow_html=True,
     )
 
-    # ------------------------------------------------------------
-    # EXISTING VALID LICENSE
-    # ------------------------------------------------------------
+    # If there is already a license row, show info
     existing = get_active_license()
     if existing and not existing.get("is_expired", False):
         st.success(
@@ -491,12 +736,9 @@ def license_activation_screen():
             f"valid till **{existing['expires_on']}**."
         )
         if st.button("Continue to Login"):
-            st.rerun()   # ✅ REQUIRED
-        return
+            return  # main() will continue after this function returns
 
-    # ------------------------------------------------------------
-    # PREFILL FROM LOCK FILE
-    # ------------------------------------------------------------
+    # Try to prefill from lock file if present
     lock = load_license_lock() or {}
     default_customer = lock.get("customer_name", "")
     default_key = lock.get("license_key", "")
@@ -529,15 +771,12 @@ def license_activation_screen():
 
     st.markdown(
         "<p style='font-size:0.9rem;color:#9ca3af;'>"
-        "The license key is generated using Customer Name + Expiry Month/Year. "
-        "Both must match exactly."
+        "Hint: The license key is generated using your customer name and expiry month/year. "
+        "Both must match exactly (spacing & spelling included)."
         "</p>",
         unsafe_allow_html=True,
     )
 
-    # ------------------------------------------------------------
-    # ACTIVATE
-    # ------------------------------------------------------------
     if st.button("🔓 Activate License", width="stretch"):
         name_clean = customer_name.strip()
         key_clean = license_key.strip().upper()
@@ -549,27 +788,23 @@ def license_activation_screen():
         try:
             exp_year = int(expiry_year)
             exp_month = int(expiry_month)
-            if not (1 <= exp_month <= 12):
+            if exp_month < 1 or exp_month > 12:
                 raise ValueError("Invalid month")
 
             expected_key = generate_license_key(name_clean, exp_year, exp_month)
+
             if key_clean != expected_key:
-                st.error("❌ Invalid license key for this customer and expiry.")
+                st.error("❌ Invalid license key for this customer and expiry. Please check and try again.")
                 return
 
-            # Expiry = last day of month
+            # Compute expiry date as last day of the month
             last_day = calendar.monthrange(exp_year, exp_month)[1]
             expires_on = date(exp_year, exp_month, last_day)
 
-            # ----------------------------------------------------
-            # 🔥 ENSURE SINGLE LICENSE ROW
-            # ----------------------------------------------------
-            execute("DELETE FROM license")
-
+            # Insert into DB
             execute(
                 """
-                INSERT INTO license
-                (license_key, customer_name, expires_on, created_at, last_run_date)
+                INSERT INTO license (license_key, customer_name, expires_on, created_at, last_run_date)
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (
@@ -581,6 +816,7 @@ def license_activation_screen():
                 ),
             )
 
+            # Save external lock file (anti-DB-delete guard)
             save_license_lock(
                 {
                     "license_key": key_clean,
@@ -592,13 +828,11 @@ def license_activation_screen():
             st.success(
                 f"✅ License activated for **{name_clean}** until **{expires_on.isoformat()}**."
             )
-
-            time.sleep(0.5)
-            st.rerun()   # ✅ REQUIRED
+            st.info("You can now restart or refresh the app to continue to login.")
+            st.rerun()
 
         except Exception as e:
             st.error(f"Activation failed: {e}")
-
 
 def hash_password(password: str) -> str:
     """Hash a password using SHA256."""
@@ -667,14 +901,25 @@ def init_db():
     c = conn.cursor()
 
     # ============================================================
-    # SQLITE SAFETY / PERFORMANCE PRAGMAS
+    # SQLITE SAFETY / PERFORMANCE PRAGMAS (WAL MODE)
     # ============================================================
     c.execute("PRAGMA journal_mode=WAL;")
     c.execute("PRAGMA synchronous=NORMAL;")
     c.execute("PRAGMA busy_timeout=5000;")
 
     # ============================================================
-    # USERS
+    # 🔹 APP META (INSTALL / TELEMETRY / HEARTBEAT)
+    # 🔹 MUST EXIST BEFORE ANY get_meta() / heartbeat CALL
+    # ============================================================
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    # ============================================================
+    # USERS TABLE
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -683,12 +928,12 @@ def init_db():
             password_hash TEXT,
             full_name TEXT,
             role TEXT,
-            allowed_modules TEXT
+            allowed_modules TEXT DEFAULT '["Home","Orders","KDS","Inventory"]'
         )
     """)
 
     # ============================================================
-    # MENU
+    # MENU TABLE
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS menu (
@@ -704,7 +949,7 @@ def init_db():
     """)
 
     # ============================================================
-    # ORDERS
+    # ORDERS TABLE
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS orders (
@@ -744,7 +989,7 @@ def init_db():
     """)
 
     # ============================================================
-    # PAYMENTS
+    # PAYMENTS TABLE
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS payments (
@@ -759,11 +1004,12 @@ def init_db():
     """)
 
     c.execute("PRAGMA table_info(payments)")
-    if "tax_amount" not in [r[1] for r in c.fetchall()]:
+    pay_cols = [row[1] for row in c.fetchall()]
+    if "tax_amount" not in pay_cols:
         c.execute("ALTER TABLE payments ADD COLUMN tax_amount REAL DEFAULT 0")
 
     # ============================================================
-    # KDS
+    # KDS ITEMS STATUS TABLE
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS kds_items_status (
@@ -776,7 +1022,7 @@ def init_db():
     """)
 
     # ============================================================
-    # LICENSE (FULLY MIGRATION-SAFE)
+    # LICENSE TABLE
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS license (
@@ -786,41 +1032,38 @@ def init_db():
             expires_on TEXT,
             created_at TEXT,
             last_run_date TEXT,
-            is_expired INTEGER DEFAULT 0,
             machine_id TEXT
         )
     """)
 
+    # Ensure machine_id column exists (for older DBs)
     c.execute("PRAGMA table_info(license)")
-    lic_cols = [r[1] for r in c.fetchall()]
-
-    if "created_at" not in lic_cols:
-        c.execute("ALTER TABLE license ADD COLUMN created_at TEXT")
-
-    if "last_run_date" not in lic_cols:
-        c.execute("ALTER TABLE license ADD COLUMN last_run_date TEXT")
-
-    if "is_expired" not in lic_cols:
-        c.execute("ALTER TABLE license ADD COLUMN is_expired INTEGER DEFAULT 0")
+    lic_cols = [row[1] for row in c.fetchall()]
 
     if "machine_id" not in lic_cols:
         c.execute("ALTER TABLE license ADD COLUMN machine_id TEXT")
-
     # ============================================================
     # BUSINESS PROFILE
     # ============================================================
     c.execute("""
         CREATE TABLE IF NOT EXISTS business_profile (
             id INTEGER PRIMARY KEY CHECK (id = 1),
-            business_name TEXT,
+            business_name TEXT NOT NULL,
             address TEXT,
             phone TEXT,
             vat_no TEXT,
-            closing_line TEXT,
-            currency TEXT DEFAULT 'GBP',
-            currency_locked INTEGER DEFAULT 0
+            closing_line TEXT
         )
     """)
+
+    c.execute("PRAGMA table_info(business_profile)")
+    existing_cols = [row[1] for row in c.fetchall()]
+
+    if "currency" not in existing_cols:
+        c.execute("ALTER TABLE business_profile ADD COLUMN currency TEXT DEFAULT 'GBP'")
+
+    if "currency_locked" not in existing_cols:
+        c.execute("ALTER TABLE business_profile ADD COLUMN currency_locked INTEGER DEFAULT 0")
 
     c.execute("""
         INSERT OR IGNORE INTO business_profile
@@ -829,10 +1072,74 @@ def init_db():
     """)
 
     # ============================================================
+    # KDS TRIGGERS
+    # ============================================================
+    c.execute("DROP TRIGGER IF EXISTS create_kds_status;")
+    c.execute("""
+        CREATE TRIGGER create_kds_status
+        AFTER INSERT ON order_items
+        BEGIN
+            INSERT INTO kds_items_status (id, order_item_id, status, updated_at)
+            VALUES (lower(hex(randomblob(16))), NEW.id, 'pending', datetime('now'));
+        END;
+    """)
+
+    c.execute("DROP TRIGGER IF EXISTS auto_in_progress_order;")
+    c.execute("""
+        CREATE TRIGGER auto_in_progress_order
+        AFTER INSERT ON order_items
+        BEGIN
+            UPDATE orders
+            SET status='in_progress',
+                updated_at=datetime('now')
+            WHERE id = NEW.order_id
+              AND status='pending'
+              AND order_type IN ('dine','takeaway','qr');
+        END;
+    """)
+
+    c.execute("DROP TRIGGER IF EXISTS auto_ready_order;")
+    c.execute("""
+        CREATE TRIGGER auto_ready_order
+        AFTER UPDATE OF status ON kds_items_status
+        WHEN NEW.status = 'done'
+        BEGIN
+            UPDATE orders
+            SET status = 'ready',
+                updated_at = datetime('now')
+            WHERE id = (
+                SELECT order_id FROM order_items WHERE id = NEW.order_item_id
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                FROM kds_items_status ks
+                JOIN order_items oi ON oi.id = ks.order_item_id
+                WHERE oi.order_id = (
+                    SELECT order_id FROM order_items WHERE id = NEW.order_item_id
+                )
+                AND ks.status != 'done'
+            );
+        END;
+    """)
+
+    # ============================================================
+    # INDEXES
+    # ============================================================
+    c.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_kds_order_item ON kds_items_status(order_item_id);")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_payments_order ON payments(order_id);")
+
+    # ============================================================
     # DEFAULT SUPERADMIN
     # ============================================================
     c.execute("SELECT COUNT(*) FROM users")
     if c.fetchone()[0] == 0:
+        full_modules = json.dumps([
+            "Home", "Orders", "KDS", "Inventory",
+            "Menu", "Payments", "Reports", "Admin", "Takeaway Status"
+        ])
         c.execute("""
             INSERT INTO users
             (id, username, password_hash, full_name, role, allowed_modules)
@@ -843,20 +1150,47 @@ def init_db():
             hash_password("admin123"),
             "Default Admin",
             "superadmin",
-            json.dumps([
-                "Home", "Orders", "KDS", "Inventory",
-                "Menu", "Payments", "Reports", "Admin", "Takeaway Status"
-            ])
+            full_modules
         ))
+        print("✔ Default superadmin created: admin / admin123")
 
     conn.commit()
     conn.close()
 
 
-
 # -------------------------------------------------------------------
 # ORDER HELPERS
 # -------------------------------------------------------------------
+
+def enable_fullscreen_pos():
+    st.markdown("""
+    <style>
+    /* Hide Streamlit default UI */
+    header {visibility: hidden;}
+    footer {visibility: hidden;}
+    #MainMenu {visibility: hidden;}
+
+    /* Remove top padding */
+    .block-container {
+        padding-top: 0.2rem !important;
+        padding-bottom: 0.2rem !important;
+        padding-left: 0.6rem !important;
+        padding-right: 0.6rem !important;
+        max-width: 100vw !important;
+    }
+
+    /* Full height app */
+    html, body, [data-testid="stApp"] {
+        height: 100%;
+        overflow: hidden;
+    }
+
+    /* Prevent scroll */
+    [data-testid="stAppViewContainer"] {
+        overflow: hidden !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
 def next_token() -> str:
     row = fetchone("SELECT token FROM orders WHERE token IS NOT NULL ORDER BY created_at DESC LIMIT 1")
@@ -1154,7 +1488,7 @@ def cleanup_rejected_orders():
 # -------------------------------------------------------------------
 import json, time, os, streamlit as st
 
-REALTIME_EVENT_FILE = os.path.join(get_app_data_dir(), "realtime_event.json")
+REALTIME_EVENT_FILE = "realtime_event.json"
 EVENT_TTL_SECONDS = 60  # auto-delete event file if older than 60s
 
 def push_realtime_event(event_type: str, payload: dict):
@@ -1224,8 +1558,8 @@ def add_order_item(order_id: str, menu_row: dict, qty: int, note: str = "") -> b
         return False
 
     # ❌ never allow items on closed / paid orders
-    if order["status"] in ("closed", "paid"):
-        st.warning("Cannot add items to a closed or paid order")
+    if order.get("status") in ("closed", "paid", "rejected"):
+        st.warning("Cannot add items to a closed / paid / rejected order")
         return False
 
     latest_menu = fetchone("SELECT * FROM menu WHERE id=?", (menu_row["id"],))
@@ -1251,33 +1585,49 @@ def add_order_item(order_id: str, menu_row: dict, qty: int, note: str = "") -> b
             order_id,
             latest_menu["id"],
             latest_menu["name"],
-            qty,
-            latest_menu["price"],
-            latest_menu["tax"],
-            note,
+            int(qty),
+            float(latest_menu["price"] or 0.0),
+            float(latest_menu["tax"] or 0.0),
+            note or "",
         ),
     )
 
     # ------------------------------------------------------------
     # STOCK REDUCTION (UNCHANGED)
     # ------------------------------------------------------------
-    new_stock = max(0, int(latest_menu["stock"]) - int(qty))
+    new_stock = max(0, int(latest_menu.get("stock") or 0) - int(qty))
     execute("UPDATE menu SET stock=? WHERE id=?", (new_stock, latest_menu["id"]))
 
     # ------------------------------------------------------------
-    # 🔥 UNIVERSAL KDS ENTRY RULE (STANDARDISED)
+    # 🔥 KDS ENTRY / RE-ENTRY RULE (FIXED)
+    #
+    # ✅ Dine/Takeaway: if you add new items later (even after READY/SERVED),
+    #    force order back to IN_PROGRESS so KDS shows it again.
+    #
+    # ✅ QR: only do this if approved=1 (unapproved QR must NOT go to KDS)
     # ------------------------------------------------------------
-    if order["status"] == "pending" and order["order_type"] in ("dine", "takeaway", "qr"):
-        execute(
-            "UPDATE orders SET status='in_progress', updated_at=? WHERE id=?",
-            (datetime.now(timezone.utc).isoformat(), order_id),
-        )
-        push_realtime_event("order_to_kds", {"order_id": order_id})
+    otype = (order.get("order_type") or "").lower()
+    approved = int(order.get("approved") or 0)
+    status = (order.get("status") or "").lower()
+
+    kds_eligible = (otype in ("dine", "takeaway")) or (otype == "qr" and approved == 1)
+
+    if kds_eligible:
+        # If order was pending/ready/served, it must come back to kitchen
+        if status in ("pending", "ready", "served"):
+            execute(
+                "UPDATE orders SET status='in_progress', updated_at=? WHERE id=?",
+                (datetime.now(timezone.utc).isoformat(), order_id),
+            )
+            push_realtime_event("order_to_kds", {"order_id": order_id})
 
     # ------------------------------------------------------------
-    # TOTAL RECALCULATION ONLY
+    # TOTAL RECALCULATION ONLY (preserving your current model)
     # ------------------------------------------------------------
-    line_total = qty * latest_menu["price"] * (1 + latest_menu["tax"] / 100.0)
+    unit_price = float(latest_menu["price"] or 0.0)
+    tax_pct = float(latest_menu["tax"] or 0.0)
+    line_total = float(qty) * unit_price * (1.0 + tax_pct / 100.0)
+
     total_row = fetchone("SELECT total FROM orders WHERE id=?", (order_id,))
     total = float(total_row["total"] or 0.0) if total_row else 0.0
     total += line_total
@@ -1924,6 +2274,7 @@ def inventory_panel():
     st.markdown("</div>", unsafe_allow_html=True)
 
 def order_builder():
+    enable_fullscreen_pos()   # ✅ ADD THIS LINE FIRST
     # ============================================================
     # 🌍 CURRENCY + TAX LABEL (DISPLAY ONLY – SAFE, GLOBAL)
     # ============================================================
@@ -1947,14 +2298,13 @@ def order_builder():
     st.session_state["tax_label"] = tax_label
 
     # ============================================================
-# 🔁 AUTO REFRESH (SAFE)
-# ============================================================
-# try:
-#     from streamlit_autorefresh import st_autorefresh
-#     st_autorefresh(interval=5000, key="order_autorefresh")
-# except Exception:
-#     pass
-
+    # 🔁 AUTO REFRESH (SAFE)
+    # ============================================================
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=5000, key="order_autorefresh")
+    except Exception:
+        pass
 
     # ============================================================
     # 🔔 REALTIME BILL REQUESTS
@@ -2026,7 +2376,7 @@ def order_builder():
 
     st.markdown(TOUCH_POS_CSS, unsafe_allow_html=True)
     st.markdown('<div class="touch-root">', unsafe_allow_html=True)
-    st.markdown("<h3 style='margin:0;'>Order Management</h3>", unsafe_allow_html=True)
+    
 
     menu_items = fetchall("SELECT * FROM menu WHERE available=1 ORDER BY category, name")
 
@@ -3013,9 +3363,8 @@ def takeaway_status_panel():
         • shown for TODAY only (history)
     - Safe across midnight
     - Search by TOKEN NUMBER only
-    - ❗ Hides takeaway orders that have no items
+    - ❗ Now hides takeaway orders that have no items
     """
-
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
     st.subheader("Takeaway Status")
 
@@ -3039,7 +3388,9 @@ def takeaway_status_panel():
         )
 
     # ------------------------------------------------------------
-    # STATUS FILTERS
+    # ✅ ACTIVE = in_progress OR ready
+    # ✅ CLOSED = paid / closed (TODAY only)
+    # ✅ EXCLUDE EMPTY ORDERS (no order_items)
     # ------------------------------------------------------------
     if include_closed:
         status_clause = """
@@ -3060,7 +3411,9 @@ def takeaway_status_panel():
         WHERE o.order_type = 'takeaway'
         {status_clause}
           AND EXISTS (
-              SELECT 1 FROM order_items oi WHERE oi.order_id = o.id
+              SELECT 1
+              FROM order_items oi
+              WHERE oi.order_id = o.id
           )
     """
     params = []
@@ -3082,45 +3435,11 @@ def takeaway_status_panel():
     # DISPLAY EACH TAKEAWAY ORDER
     # ------------------------------------------------------------
     for o in orders:
-        order_id = o["id"]
         token = o.get("token") or "N/A"
+        status_raw = (o.get("status") or "").upper()
         total = float(o.get("total") or 0.0)
 
-        # ======================================================
-        # 🔁 KITCHEN → ORDER STATUS SYNC (CORRECT & SAFE)
-        # ======================================================
-        totals = fetchone(
-            "SELECT COUNT(*) AS cnt FROM order_items WHERE order_id=?",
-            (order_id,)
-        )
-        done_cnt = fetchone(
-            """
-            SELECT COUNT(*) AS cnt
-            FROM kds_items_status
-            WHERE status='done'
-              AND order_item_id IN (
-                  SELECT id FROM order_items WHERE order_id=?
-              )
-            """,
-            (order_id,)
-        )
-
-        total_items = totals["cnt"] if totals else 0
-        done_items = done_cnt["cnt"] if done_cnt else 0
-
-        if total_items > 0:
-            new_status = "ready" if done_items == total_items else "in_progress"
-
-            if o["status"] != new_status:
-                execute(
-                    "UPDATE orders SET status=?, updated_at=datetime('now') WHERE id=?",
-                    (new_status, order_id)
-                )
-                o["status"] = new_status  # reflect immediately
-
-        status_raw = (o.get("status") or "").upper()
-
-        # 🎨 STATUS DISPLAY
+        # 🎨 STATUS COLOR LOGIC (KITCHEN-CENTRIC)
         if status_raw in ("CLOSED", "PAID"):
             status_html = "<span style='color:#16a34a;font-weight:900;'>CLOSED</span>"
         elif status_raw == "READY":
@@ -3153,7 +3472,7 @@ def takeaway_status_panel():
             WHERE oi.order_id = ?
             ORDER BY oi.created_at
             """,
-            (order_id,)
+            (o["id"],)
         )
 
         if not items:
@@ -3192,6 +3511,7 @@ def takeaway_status_panel():
         st.markdown("---")
 
     st.markdown("</div>", unsafe_allow_html=True)
+
 
 def generate_bill_html(order_id: str) -> str:
     order = fetchone("SELECT * FROM orders WHERE id=?", (order_id,))
@@ -3368,6 +3688,7 @@ def _kds_mark_printed(order_id: str, item_ids: list, full=False):
 
 
 # ---------------- KDS VIEW ----------------
+
 def kds_view():
     """
     🍳 Unified Kitchen Display System (KDS)
@@ -3480,15 +3801,15 @@ def kds_view():
         if not items:
             continue
 
-        # ✅ if ALL items are ready/done → hide from KDS (your existing behavior)
+        # ✅ NEW: if ALL items are ready/done → hide from KDS
         all_done_for_kds = all(
             (item["kds_status"] or "").lower() in ("ready", "done")
             for item in items
         )
         if all_done_for_kds:
+            # Do not show this order on KDS; FOH still handles it
             continue
 
-        # ✅ Preserve your print tracking logic
         log = _kds_get_log(order_id)
         printed_ids = log["printed_items"]
 
@@ -3511,7 +3832,6 @@ def kds_view():
 
         st.markdown(f"<b>{order_label}</b>", unsafe_allow_html=True)
 
-        # ✅ Print button restored exactly
         if st.button("🖨️ Print Ticket", key=f"print_{order_id}"):
             if not log["full_print_done"]:
                 print_ticket_via_component(order_id)
@@ -3520,9 +3840,6 @@ def kds_view():
                 print_ticket_via_component(order_id, only_items=list(new_item_ids))
                 _kds_mark_printed(order_id, list(new_item_ids))
 
-        # ======================================================
-        # ITEMS GRID
-        # ======================================================
         for i in range(0, len(items), 3):
             cols = st.columns(3)
             for j, col in enumerate(cols):
@@ -3531,7 +3848,7 @@ def kds_view():
 
                 item = items[i + j]
                 item_id = item["id"]
-                current_status = (item["kds_status"] or "pending").lower()
+                current_status = item["kds_status"]
 
                 css_key = current_status if current_status in (
                     "in_progress", "ready", "done"
@@ -3548,38 +3865,22 @@ def kds_view():
                         unsafe_allow_html=True,
                     )
 
-                    # ✅ FIXED DONE (UPSERT) — does NOT break print flow
                     if st.button("✅ DONE", key=f"done_item_{item_id}") and current_status != "done":
-                        exists = fetchone(
-                            "SELECT id FROM kds_items_status WHERE order_item_id=?",
+                        execute(
+                            """
+                            UPDATE kds_items_status
+                            SET status='done', updated_at=datetime('now')
+                            WHERE order_item_id=?
+                            """,
                             (item_id,),
                         )
-
-                        if exists:
-                            execute(
-                                """
-                                UPDATE kds_items_status
-                                SET status='done', updated_at=datetime('now')
-                                WHERE order_item_id=?
-                                """,
-                                (item_id,),
-                            )
-                        else:
-                            execute(
-                                """
-                                INSERT INTO kds_items_status (id, order_item_id, status, updated_at)
-                                VALUES (lower(hex(randomblob(16))), ?, 'done', datetime('now'))
-                                """,
-                                (item_id,),
-                            )
-
                         push_realtime_event("kds_updated", {"order_id": order_id})
                         st.rerun()
 
         st.markdown("---")
 
     # ======================================================
-    # AUTO-PRINT EXECUTION (RESTORED)
+    # AUTO-PRINT EXECUTION
     # ======================================================
     for (order_id, item_ids, full) in auto_print_queue:
         print_ticket_via_component(order_id, only_items=None if full else item_ids)
@@ -3798,6 +4099,7 @@ def recalc_order_total(order_id: str):
         ),
     )
 
+
 def render_touch_cart(order_id: str, context: str):
     order = fetchone("SELECT * FROM orders WHERE id=?", (order_id,))
     if not order:
@@ -3809,63 +4111,44 @@ def render_touch_cart(order_id: str, context: str):
         (order_id,),
     )
 
-    active_item_id = st.session_state.get("active_cart_item_id")
-
     # ============================================================
     # 🌍 DISPLAY CONTEXT
     # ============================================================
     symbol = st.session_state.get("currency_symbol", "£")
+    tax_label = st.session_state.get("tax_label", "VAT")
 
     # ============================================================
-    # 🎨 SIMPLE INVENTORY-STYLE CART CSS
+    # STYLES (SINGLE LINE ITEMS + KDS FIX)
     # ============================================================
     st.markdown("""
     <style>
-    .cart-header {
-        font-size: 1.05rem;
-        font-weight: 800;
-        margin-bottom: 10px;
+    .cart-line {
+        display:flex;
+        justify-content:space-between;
+        align-items:center;
+        padding:6px 8px;
+        border-bottom:1px dashed #e5e7eb;
+        font-size:0.95rem;
+        color:#ffffff;
+        background:#1f2937;
+        margin-bottom:2px;
     }
-    .cart-row {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: 6px 2px;
-        border-bottom: 1px solid rgba(255,255,255,0.06);
-        font-size: 0.95rem;
-    }
-    .cart-name {
-        font-weight: 500;
-    }
-    .cart-pill {
-        background: rgba(34,197,94,0.15);
-        color: #22c55e;
-        padding: 2px 8px;
-        border-radius: 8px;
-        font-size: 0.85rem;
-        font-weight: 600;
-        margin-left: 6px;
-    }
-    .cart-remove button {
-        background: none !important;
-        color: #ef4444 !important;
-        font-weight: 800 !important;
-        border: none !important;
-        padding: 0 !important;
-    }
-    .cart-total {
-        margin-top: 10px;
-        font-size: 1.15rem;
-        font-weight: 900;
-    }
-    .kds-pill {
-        font-size: 0.7rem;
-        padding: 2px 6px;
-        border-radius: 6px;
-        background: #374151;
-        color: #e5e7eb;
-        margin-top: 2px;
-        width: fit-content;
+
+    .cart-name { font-weight:600; color:#ffffff; }
+    .cart-price { font-weight:700; white-space:nowrap; color:#ffffff; }
+
+    .cart-header { font-size:1.1rem; font-weight:800; margin-bottom:8px; }
+    .cart-total { font-size:1.25rem; font-weight:900; margin-top:10px; }
+
+    .kds-badge {
+        font-size:0.7rem;
+        color:white;
+        background:#4b5563;
+        padding:2px 6px;
+        border-radius:6px;
+        display:inline-block;
+        margin-top:0;
+        margin-bottom:6px;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -3878,12 +4161,12 @@ def render_touch_cart(order_id: str, context: str):
 
     st.markdown(
         f"<div class='cart-header'>Order <b>{label}</b> "
-        f"<span style='font-size:0.75rem;color:#9ca3af;'>[{status}]</span></div>",
+        f"<span style='font-size:0.8rem;color:#9ca3af;'>[{status}]</span></div>",
         unsafe_allow_html=True,
     )
 
     # ============================================================
-    # ITEMS (SIMPLE LIST)
+    # ITEMS (ONE LINE ONLY)
     # ============================================================
     if not items:
         st.info("No items yet.")
@@ -3894,44 +4177,32 @@ def render_touch_cart(order_id: str, context: str):
             tax_val = base * (it["tax"] / 100)
             line_total = base + tax_val
 
-            c1, c2, c3 = st.columns([6, 2, 1])
+            col_text, col_x = st.columns([9, 1])
 
-            with c1:
-                if st.button(
-                    f"{it['name']}",
-                    key=f"row_{context}_{it['id']}",
-                ):
-                    st.session_state["active_cart_item_id"] = it["id"]
-                    st.rerun()
-
-                kds = fetchone(
-                    "SELECT status FROM kds_items_status WHERE order_item_id=?",
-                    (it["id"],),
-                )
-                kds_status = (kds["status"] if kds else "pending").upper()
+            with col_text:
                 st.markdown(
-                    f"<div class='kds-pill'>{kds_status}</div>",
+                    f"""
+                    <div class="cart-line">
+                        <div class="cart-name">{html.escape(it['name'])} ×{qty}</div>
+                        <div class="cart-price">{symbol}{line_total:.2f}</div>
+                    </div>
+                    """,
                     unsafe_allow_html=True,
                 )
 
-            with c2:
-                st.markdown(
-                    f"<span class='cart-pill'>x{qty}</span>",
-                    unsafe_allow_html=True,
-                )
-                st.markdown(
-                    f"<span class='cart-pill'>{symbol}{line_total:.2f}</span>",
-                    unsafe_allow_html=True,
-                )
-
-            with c3:
+            with col_x:
                 if st.button("✖", key=f"rm_{context}_{it['id']}"):
                     execute("DELETE FROM order_items WHERE id=?", (it["id"],))
                     recalc_order_total(order_id)
                     push_realtime_event("order_updated", {"order_id": order_id})
-                    if st.session_state.get("active_cart_item_id") == it["id"]:
-                        st.session_state.pop("active_cart_item_id", None)
                     st.rerun()
+
+            kds = fetchone(
+                "SELECT status FROM kds_items_status WHERE order_item_id=?",
+                (it["id"],),
+            )
+            kds_status = (kds["status"] if kds else "pending").upper()
+            st.markdown(f"<div class='kds-badge'>{kds_status}</div>", unsafe_allow_html=True)
 
     # ============================================================
     # TOTAL
@@ -3946,28 +4217,25 @@ def render_touch_cart(order_id: str, context: str):
     )
 
     # ============================================================
-    # 🧾 PRINT BILL (DINE-IN)
+    # 🧾 PRINT BILL — DINE-IN ONLY
     # ============================================================
     if context == "dine" and order_total > 0:
         if st.button("🖨️ Print / Show Bill", key=f"print_bill_{order_id}", width="stretch"):
             st.session_state["__bill_to_show__"] = order_id
 
     # ============================================================
-    # 🍽️ DINE-IN PAYMENT
+    # 🍽️ DINE-IN PAYMENT + CLOSE
     # ============================================================
     if context == "dine" and order_total > 0:
         st.markdown("### 💳 Payment")
+
         method = st.radio(
-            "Method",
-            ["Cash", "Card"],
-            horizontal=True,
-            key=f"dine_pay_method_{order_id}",
+            "Method", ["Cash", "Card"], horizontal=True,
+            key=f"dine_pay_method_{order_id}"
         )
 
         if st.button("✅ Confirm Payment", key=f"dine_confirm_{order_id}", width="stretch"):
-            already_paid = fetchone(
-                "SELECT paid FROM orders WHERE id=?", (order_id,)
-            )["paid"]
+            already_paid = fetchone("SELECT paid FROM orders WHERE id=?", (order_id,))["paid"]
 
             if already_paid:
                 st.warning("⚠️ Order already paid.")
@@ -3986,17 +4254,18 @@ def render_touch_cart(order_id: str, context: str):
                         datetime.now(timezone.utc).isoformat(),
                     ),
                 )
+
                 execute(
                     "UPDATE orders SET paid=1, updated_at=? WHERE id=?",
                     (datetime.now(timezone.utc).isoformat(), order_id),
                 )
+
                 st.success("💰 Payment recorded.")
                 st.rerun()
 
         if st.button("🧾 Close Table", key=f"dine_close_{order_id}", width="stretch"):
-            paid_chk = fetchone(
-                "SELECT paid FROM orders WHERE id=?", (order_id,)
-            )["paid"]
+            paid_chk = fetchone("SELECT paid FROM orders WHERE id=?", (order_id,))["paid"]
+
             if not paid_chk:
                 st.error("❌ Cannot close table before payment.")
             else:
@@ -4005,30 +4274,21 @@ def render_touch_cart(order_id: str, context: str):
                     (datetime.now(timezone.utc).isoformat(), order_id),
                 )
                 st.session_state.pop("open_table_order_id", None)
-                st.session_state.pop("active_cart_item_id", None)
                 st.success("✅ Table closed.")
                 st.rerun()
 
     # ============================================================
-    # 🥡 TAKEAWAY PAYMENT
+    # 🥡 TAKEAWAY PAYMENT → PRINT RECEIPT
     # ============================================================
     if context == "tky" and order_total > 0:
         st.markdown("### 💳 Payment")
+
         method = st.radio(
-            "Method",
-            ["Cash", "Card"],
-            horizontal=True,
-            key=f"tky_pay_method_{order_id}",
+            "Method", ["Cash", "Card"], horizontal=True,
+            key=f"tky_pay_method_{order_id}"
         )
 
         if st.button("✅ Confirm Payment", key=f"tky_confirm_{order_id}", width="stretch"):
-            already_paid = fetchone(
-                "SELECT paid FROM orders WHERE id=?", (order_id,)
-            )["paid"]
-            if already_paid:
-                st.warning("⚠️ Order already paid.")
-                return
-
             execute(
                 """
                 INSERT INTO payments (id, order_id, method, amount, tax_amount, created_at)
@@ -4057,9 +4317,10 @@ def render_touch_cart(order_id: str, context: str):
 
             st.session_state["__bill_to_show__"] = order_id
             st.session_state.pop("open_takeaway_order_id", None)
-            st.session_state.pop("active_cart_item_id", None)
+
             st.success("💰 Payment recorded.")
             st.rerun()
+
 
 # ---------------- QR CUSTOMER ORDERING (TABLE SCAN) ----------------
 
@@ -4264,6 +4525,8 @@ def qr_order_page(table_no: str = None):
     • Approval remains mandatory
     • Customer can cancel items BEFORE placing
     • Customer can ADD MORE even after placing (pending approval)
+    • BLOCK unavailable items with clear message
+    • Show order confirmation message
     """
     import html, time, uuid
     from streamlit_autorefresh import st_autorefresh
@@ -4295,15 +4558,7 @@ def qr_order_page(table_no: str = None):
         return
 
     table_no = str(table_no).upper().strip()
-
-    # ============================================================
-    # ✅ SAFE QR SIGNATURE VALIDATION (WON'T BLOCK PAGE)
-    # ============================================================
-    try:
-        validate_qr_sig(table_no, sig, strict=False)
-    except Exception:
-        # Do NOT block customer ordering page
-        st.warning("⚠️ QR security signature missing/invalid. Demo mode access enabled.")
+    validate_qr_sig(table_no, sig, strict=False)
 
     cart_key = f"qr_cart_{table_no}"
 
@@ -4318,8 +4573,6 @@ def qr_order_page(table_no: str = None):
         "QAR": "ر.ق", "SAR": "﷼", "OMR": "﷼",
     }
     symbol = CURRENCY_SYMBOLS.get(currency, currency + " ")
-
-    tax_label = "GST" if currency == "INR" else "VAT"
 
     # ============================================================
     # HEADER
@@ -4380,18 +4633,30 @@ def qr_order_page(table_no: str = None):
     left, right = st.columns(2)
 
     # ============================================================
-    # MENU SIDE
+    # MENU SIDE (BLOCK UNAVAILABLE ITEMS)
     # ============================================================
     with left:
         if not active_cat:
             st.info("Select a category")
         else:
             for it in [m for m in menu if (m.get("category") or "Other") == active_cat]:
+                disabled = int(it.get("stock") or 0) <= 0
+                label = (
+                    f"{html.escape(it['name'])} — {symbol}{it['price']:.2f}"
+                    if not disabled
+                    else f"{html.escape(it['name'])} — ❌ Unavailable"
+                )
+
                 if st.button(
-                    f"{html.escape(it['name'])} — {symbol}{it['price']:.2f}",
+                    label,
                     key=f"tap_{table_no}_{it['id']}",
                     width="stretch",
+                    disabled=disabled,
                 ):
+                    if disabled:
+                        st.error("❌ Item unavailable")
+                        st.stop()
+
                     cart.setdefault(it["id"], {"menu": it, "qty": 0})
                     cart[it["id"]]["qty"] += 1
                     st.session_state[cart_key] = cart
@@ -4421,10 +4686,17 @@ def qr_order_page(table_no: str = None):
                         st.rerun()
 
         # ========================================================
-        # PLACE ORDER (SAFE APPEND)
+        # PLACE ORDER (WITH INVENTORY VALIDATION + CONFIRMATION)
         # ========================================================
         if cart:
             if st.button("🚀 Place Order", width="stretch"):
+
+                # 🔒 FINAL SAFETY: inventory validation
+                for entry in cart.values():
+                    if int(entry["menu"].get("stock") or 0) <= 0:
+                        st.error(f"❌ {entry['menu']['name']} is unavailable")
+                        st.stop()
+
                 if active_order and int(active_order.get("paid") or 0) == 0:
                     order_id = active_order["id"]
                 else:
@@ -4443,7 +4715,9 @@ def qr_order_page(table_no: str = None):
 
                 st.session_state[cart_key] = {}
                 push_realtime_event("order_updated", {"order_id": order_id})
-                st.success("✅ Order sent for approval. You may add more items.")
+
+                st.success("✅ Order placed successfully")
+                time.sleep(5)
                 st.rerun()
 
         # ========================================================
@@ -4456,7 +4730,6 @@ def qr_order_page(table_no: str = None):
         ):
             push_realtime_event("bill_request", {"table_no": table_no})
             st.rerun()
-
 
 
 
@@ -4987,26 +5260,16 @@ def main():
         layout="wide",
         initial_sidebar_state="collapsed"
     )
+    
 
     # ============================================================
-    # 🔓 PUBLIC QR ACCESS (MUST RUN FIRST – NO LICENSE / LOGIN)
+    # 🔒 SESSION KEEP-ALIVE (PREVENT AUTO LOGOUT)
     # ============================================================
-    try:
-        params = st.query_params
-    except Exception:
-        params = st.experimental_get_query_params()
-
-    qr_val = params.get("qr")
-    table_val = params.get("table")
-
-    if isinstance(qr_val, list):
-        qr_val = qr_val[0]
-    if isinstance(table_val, list):
-        table_val = table_val[0]
-
-    if qr_val == "1" and table_val:
-        qr_order_page(table_val)
-        st.stop()   # ⛔ stop everything else (NO license, NO login)
+    # Keeps Streamlit session alive even when idle
+    st_autorefresh(
+        interval=120_000,   # 2 minutes
+        key="qpos_keep_alive"
+    )
 
     # ============================================================
     # 🔷 GLOBAL NEON BRANDING (ALL PAGES – SAFE)
@@ -5025,16 +5288,18 @@ def main():
         font-weight: 900 !important;
         letter-spacing: -0.5px;
     }}
+
     .nav-col h1, .nav-col h2, .nav-col h3 {{
         color: #1F4ED8 !important;
     }}
+
     .qpos-brand-global {{
         position: fixed;
         top: 14px;
-        right: 24px;
+        right: 54px;
         z-index: 9999;
         font-family: Inter, sans-serif;
-        font-size: 30px;
+        font-size: 50px;
         font-weight: 900;
         letter-spacing: -1px;
         color: #1F4ED8;
@@ -5045,18 +5310,39 @@ def main():
             0 0 28px rgba(0,229,255,0.6);
     }}
     </style>
+
     <div class="qpos-brand-global">{brand_name}</div>
     """, unsafe_allow_html=True)
 
     # ============================================================
+    # 🔓 PUBLIC QR PAGE (NO LICENSE / NO LOGIN)
+    # ============================================================
+    try:
+        params = st.query_params
+    except Exception:
+        params = st.experimental_get_query_params()
+
+    qr_val = params.get("qr")
+    table_val = params.get("table")
+
+    if isinstance(qr_val, list):
+        qr_val = qr_val[0]
+    if isinstance(table_val, list):
+        table_val = table_val[0]
+
+    if qr_val == "1" and table_val:
+        qr_order_page(table_val)
+        st.stop()
+
+    # ============================================================
     # INIT SYSTEMS
     # ============================================================
-    if not getattr(sys, "frozen", False):
-        if "ws_started" not in st.session_state:
-            start_ws_listener()
-            st.session_state["ws_started"] = True
+    if "ws_started" not in st.session_state:
+        start_ws_listener()
+        st.session_state["ws_started"] = True
 
     init_db()
+    run_heartbeat_once_per_day()
 
     # ============================================================
     # AUTO CLEANUP
@@ -5101,12 +5387,13 @@ def main():
     show_expiry_warning_if_needed(active_license)
 
     # ============================================================
-    # LOGIN (NO DOUBLE FORM)
+    # 🔑 LOGIN
     # ============================================================
     if "user" not in st.session_state:
         with st.form("login", clear_on_submit=True):
             username = st.text_input("Username")
             password = st.text_input("Password", type="password")
+
             if st.form_submit_button("Login"):
                 if login(username, password):
                     st.session_state["active_page"] = "Home"
@@ -5163,6 +5450,7 @@ def main():
         for mod in visible_modules:
             is_active = st.session_state["active_page"] == mod
             btn_type = "primary" if is_active else "secondary"
+
             if st.button(mod, type=btn_type, width="stretch"):
                 st.session_state["active_page"] = mod
                 st.rerun()
@@ -5200,17 +5488,5 @@ def main():
             admin_panel()
 
 
-
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
